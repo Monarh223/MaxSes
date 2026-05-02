@@ -10,7 +10,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 user_states = {}
 
-MAX_CHECK_TOKEN_URL = "https://max.ru/api/v2/auth/check_token"
+MAX_TOKEN_LOGIN_URL = "https://max.ru/api/auth/token_login"
 MAX_REQUEST_CODE_URL = "https://max.ru/api/auth/request_code"
 MAX_CONFIRM_CODE_URL = "https://max.ru/api/auth/confirm_code"
 
@@ -24,21 +24,32 @@ HEADERS = {
 
 
 def check_token(access_token):
+    """
+    Проверяет токен через веб-эндпоинт MAX.
+    Имитирует вход по токену как на сайте max.ru.
+    """
     try:
-        url = f"{MAX_CHECK_TOKEN_URL}?token={access_token}"
-        resp = requests.get(url, headers=HEADERS, timeout=15)
-        logging.info(f"Status: {resp.status_code} | Response: {resp.text[:200]}")
+        resp = requests.post(
+            MAX_TOKEN_LOGIN_URL,
+            headers=HEADERS,
+            json={"token": access_token},
+            timeout=15
+        )
+        logging.info(f"Status: {resp.status_code} | Response: {resp.text[:300]}")
+        
         if resp.status_code == 200:
             data = resp.json()
-            if data.get("valid") or data.get("success"):
+            if data.get("success") or data.get("access_token"):
                 user = data.get("user", {})
                 info = f"ID: {user.get('id', 'N/A')}\nИмя: {user.get('first_name', 'N/A')} {user.get('last_name', '')}\nТелефон: {user.get('phone', 'N/A')}"
                 return True, info
-            return False, data.get("error", "Сессия недействительна")
+            return False, data.get("error", "Токен не принят")
         elif resp.status_code == 401:
-            return False, "Токен недействителен (401)"
+            return False, "Токен недействителен"
         elif resp.status_code == 403:
-            return False, "Доступ запрещён (403)"
+            return False, "Токен заблокирован"
+        elif resp.status_code == 404:
+            return False, "Эндпоинт не найден. Нужен другой URL."
         else:
             return False, f"Ошибка сервера: {resp.status_code}"
     except Exception as e:
