@@ -3,24 +3,15 @@ import json
 import logging
 from telebot import TeleBot
 from telebot.types import ReplyKeyboardMarkup, KeyboardButton
-from pymax_async import Client as AsyncClient, errors as MaxErrors
+from pymax import MaxClient
+from pymax.payloads import UserAgentPayload
 
-# --- НАСТРОЙКИ ---
 BOT_TOKEN = "8407984730:AAGVNP8TWRP7AcsrWk5xod0z8qbsW7qt3lE"
-# IP-адреса серверов MAX (можно получить утилитой resolve_max_ips.py из состава PyMax или из логов бота)
-MAX_SERVER_IPS = [
-    "185.32.84.201",  # пример
-    # сюда нужно добавить актуальные IP
-]
-PROXY_URL = None  # "socks5://login:password@host:port" — если нужен прокси
-# --- КОНЕЦ НАСТРОЕК ---
 
 bot = TeleBot(BOT_TOKEN)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
 user_states = {}
 
-# Клавиатуры
 def main_keyboard():
     markup = ReplyKeyboardMarkup(resize_keyboard=True, row_width=1)
     markup.add(KeyboardButton("📱 Войти по номеру"), KeyboardButton("🔑 Войти по токену"))
@@ -32,41 +23,36 @@ def cancel_keyboard():
     return markup
 
 async def login_via_token(access_token, device_params):
-    """Пытается войти в MAX с помощью токена и параметров устройства."""
-    # Создаём клиент с расширенными настройками, как у @BcallMax_bot
-    client = AsyncClient(
-        max_server_ips=MAX_SERVER_IPS,  # принудительные IP
-        proxy=PROXY_URL,
-        device_model=device_params.get("device", "Desktop"),
+    # Настраиваем точный "отпечаток" устройства
+    ua = UserAgentPayload(
         device_type=device_params.get("deviceType", "DESKTOP"),
-        system_version=device_params.get("osVersion", "macOS 14.5"),
         app_version=device_params.get("appVersion", "26.2.3"),
-        lang_code=device_params.get("locale", "ru-RU"),
-        screen_resolution=device_params.get("screen", "1440x900"),
-        timezone=device_params.get("timezone", "UTC"),
-        user_agent=device_params.get("headerUserAgent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.6422.60 Safari/537.36"),
-        tls_verify=False,  # аналог MAX_TLS_INSECURE=1
+        system_version=device_params.get("osVersion", "macOS Sonoma 14.5"),
+        screen=device_params.get("screen", "1440x900 2.0x"),
+        timezone=device_params.get("timezone", "Asia/Vladivostok"),
+        locale=device_params.get("locale", "ru-RU"),
+        device_id=device_params.get("deviceId", "581a9ea526a673bd"),
         client_session_id=device_params.get("clientSessionId", 17),
+        user_agent=device_params.get("headerUserAgent", 
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.6422.60 Safari/537.36")
     )
+
+    client = MaxClient(
+        token=access_token,
+        work_dir="cache",
+        headers=ua,
+        tls_verify=False  # аналог MAX_TLS_INSECURE=1
+    )
+
     try:
-        # Выполняем вход по токену
-        await client.login(token=access_token)
-        # Если дошли сюда, вход успешен
-        me = await client.get_me()
-        info = f"ID: {me.id}\nИмя: {me.first_name} {me.last_name or ''}\nТелефон: {me.phone}"
+        await client.start()
+        me = client.me
+        info = f"ID: {me.id}\nИмя: {me.firstname} {me.lastname or ''}\nТелефон: {me.phone}"
         await client.stop()
         return True, info
-    except MaxErrors.InvalidTokenError:
-        await client.stop()
-        return False, "Токен недействителен"
-    except MaxErrors.SessionExpiredError:
-        await client.stop()
-        return False, "Сессия истекла"
     except Exception as e:
         await client.stop()
         return False, f"Ошибка: {e}"
-
-# ---- Остальная логика бота ----
 
 @bot.message_handler(commands=['start'])
 def start(message):
@@ -95,7 +81,6 @@ def handle_message(message):
         return
 
     if state == "waiting_phone":
-        # Функция по номеру позже
         del user_states[chat_id]
         bot.reply_to(message, "⏳ Вход по номеру временно отключён.", reply_markup=main_keyboard())
         return
@@ -116,13 +101,10 @@ def handle_message(message):
         except json.JSONDecodeError:
             bot.reply_to(message, "❌ Неверный JSON. Попробуйте ещё раз.", reply_markup=cancel_keyboard())
             return
-
         if not device_params.get("deviceType") or not device_params.get("clientSessionId"):
             bot.reply_to(message, "❌ В JSON обязательно нужны поля *deviceType* и *clientSessionId*.", parse_mode="Markdown", reply_markup=cancel_keyboard())
             return
-
         bot.reply_to(message, "🔍 Выполняю вход в аккаунт...")
-        # Запускаем асинхронную функцию
         valid, info = asyncio.run(login_via_token(access_token, device_params))
         if valid:
             bot.reply_to(message, f"🟢 **АККАУНТ ЖИВОЙ!**\n\n```\n{info}\n```", parse_mode="Markdown", reply_markup=main_keyboard())
