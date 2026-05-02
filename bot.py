@@ -104,24 +104,28 @@ def handle_message(message):
             return
 
         msg = bot.reply_to(message, "🔍 Выполняю вход в аккаунт...")
-        async def process():
-            valid, info = await login_via_token(access_token, device_params)
-            if valid:
-                await bot.edit_message_text(
-                    chat_id=chat_id, message_id=msg.message_id,
-                    text=f"🟢 **АККАУНТ ЖИВОЙ!**\n\n```\n{info}\n```",
-                    parse_mode="Markdown", reply_markup=main_keyboard()
-                )
-                with open("valid_accounts.txt", "a") as f:
-                    f.write(f"[TOKEN] {access_token[:50]}... | {info}\n")
-            else:
-                await bot.edit_message_text(
-                    chat_id=chat_id, message_id=msg.message_id,
-                    text=f"🔴 **АККАУНТ МЁРТВ**\n\n{info}",
-                    reply_markup=main_keyboard()
-                )
-            del user_states[chat_id]
-        asyncio.ensure_future(process())
+
+        # Создаём новый event loop для текущего потока и выполняем вход
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        valid, info = loop.run_until_complete(login_via_token(access_token, device_params))
+        loop.close()
+
+        if valid:
+            bot.edit_message_text(
+                chat_id=chat_id, message_id=msg.message_id,
+                text=f"🟢 **АККАУНТ ЖИВОЙ!**\n\n```\n{info}\n```",
+                parse_mode="Markdown", reply_markup=main_keyboard()
+            )
+            with open("valid_accounts.txt", "a") as f:
+                f.write(f"[TOKEN] {access_token[:50]}... | {info}\n")
+        else:
+            bot.edit_message_text(
+                chat_id=chat_id, message_id=msg.message_id,
+                text=f"🔴 **АККАУНТ МЁРТВ**\n\n{info}",
+                reply_markup=main_keyboard()
+            )
+        del user_states[chat_id]
         return
 
 if __name__ == "__main__":
