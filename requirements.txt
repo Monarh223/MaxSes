@@ -1,2 +1,3 @@
 pyTelegramBotAPI==4.14.0
-pymax-async==0.1.2
+maxapi-python
+requests==2.31.0
