@@ -20,31 +20,28 @@ const cancelKeyboard = {
   }
 };
 
-// Функция проверки токена через webmaxsocket с полной имитацией устройства
-async function checkToken(accessToken) {
+// Функция проверки токена с ПОЛНОЙ кастомизацией параметров устройства
+async function checkToken(accessToken, deviceParams) {
     const client = new WebMaxClient({
         name: 'token_check_session',
         token: accessToken,
-        deviceType: 'DESKTOP', // <-- Имитируем десктоп, как в твоем браузере
+        deviceType: deviceParams.deviceType || 'DESKTOP',
         saveToken: false,
         debug: false,
-        // Параметры из твоего скриншота с JSON'ом об устройстве
-        ua: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.6422.60 Safari/537.36',
-        appVersion: '26.2.3',
-        buildNumber: 23185,
-        osVersion: 'macOS Sonoma 14.5',
-        screen: '1440x900 2.0x',
-        timezone: 'Asia/Vladivostok',
-        locale: 'ru-RU',
-        clientSessionId: 17
+        ua: deviceParams.ua || deviceParams.headerUserAgent || 'Mozilla/5.0',
+        appVersion: deviceParams.appVersion || '26.2.3',
+        buildNumber: deviceParams.buildNumber || 23185,
+        osVersion: deviceParams.osVersion || 'macOS 14.5',
+        screen: deviceParams.screen || '1440x900',
+        timezone: deviceParams.timezone || 'UTC',
+        locale: deviceParams.locale || 'ru-RU',
+        clientSessionId: deviceParams.clientSessionId || 17
     });
 
     try {
         await client.start();
-        // Если client.start() прошел успешно, сессия активна
-        const userInfo = `Статус: Вход выполнен успешно`;
         await client.stop();
-        return { valid: true, info: userInfo };
+        return { valid: true, info: 'Статус: Вход выполнен успешно' };
     } catch (error) {
         await client.stop();
         return { valid: false, info: `Ошибка: ${error.message}` };
@@ -77,8 +74,9 @@ bot.on('text', async (ctx) => {
     }
 
     if (state === "waiting_phone") {
+        // Заглушка для входа по номеру
         delete userStates[chatId];
-        return ctx.reply("⏳ Функция входа по номеру временно недоступна. Пожалуйста, воспользуйтесь входом по токену.", mainKeyboard);
+        return ctx.reply("⏳ Функция входа по номеру временно недоступна.", mainKeyboard);
     }
 
     if (state === "waiting_token") {
@@ -87,16 +85,39 @@ bot.on('text', async (ctx) => {
             return ctx.reply("❌ Токен слишком короткий.", cancelKeyboard);
         }
         
-        await ctx.reply("🔍 Выполняю вход в аккаунт...");
-        const result = await checkToken(accessToken);
+        // Сохраняем токен и запрашиваем JSON
+        userStates[chatId] = { state: "waiting_json", token: accessToken };
+        return ctx.reply(
+            "📲 Теперь отправьте JSON с параметрами устройства одной строкой.\n\n" +
+            "Должны быть поля: *deviceType*, *clientSessionId*, *appVersion*, *headerUserAgent*, *osVersion*, *screen*, *timezone*, *locale*.",
+            { parse_mode: "Markdown", ...cancelKeyboard }
+        );
+    }
+
+    if (state === "waiting_json") {
+        const accessToken = userStates[chatId].token;
+        let deviceParams;
+        
+        try {
+            deviceParams = JSON.parse(text);
+        } catch (e) {
+            return ctx.reply("❌ Неверный формат JSON. Попробуйте еще раз.", cancelKeyboard);
+        }
+        
+        if (!deviceParams.deviceType || !deviceParams.clientSessionId) {
+            return ctx.reply("❌ В JSON обязательно должны быть поля *deviceType* и *clientSessionId*.", { parse_mode: "Markdown", ...cancelKeyboard });
+        }
+
+        await ctx.reply("🔍 Выполняю вход в аккаунт с вашими параметрами...");
+        const result = await checkToken(accessToken, deviceParams);
         
         if (result.valid) {
             await ctx.reply(`🟢 **АККАУНТ ЖИВОЙ! Вход выполнен!**\n\n\`\`\`\n${result.info}\n\`\`\``, { parse_mode: "Markdown", ...mainKeyboard });
-            // Здесь можно добавить запись в файл valid_accounts.txt
         } else {
             await ctx.reply(`🔴 **АККАУНТ МЁРТВ**\n\n${result.info}`, mainKeyboard);
         }
         delete userStates[chatId];
+        return;
     }
 });
 
