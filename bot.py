@@ -5,7 +5,7 @@ import logging
 import json
 import websockets
 
-BOT_TOKEN = "СЮДА_ТОКЕН_ОТ_BOTFATHER"
+BOT_TOKEN = "8407984730:AAGVNP8TWRP7AcsrWk5xod0z8qbsW7qt3lE"
 
 bot = telebot.TeleBot(BOT_TOKEN)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
