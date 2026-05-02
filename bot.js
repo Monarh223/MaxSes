@@ -1,61 +1,41 @@
-const { Telegraf } = require('telegraf');
+const { Telegraf, Markup } = require('telegraf');
 const { WebMaxClient } = require('webmaxsocket');
 
 const BOT_TOKEN = "8407984730:AAGuKV9CD2VC99Jl2oeL5qFnGsMj5mufWvE";
-
-// Прокси для обхода блокировок.
-// Если переменная окружения PROXY_URL не задана, бот попробует работать без прокси.
-function getProxyUrl() {
-  return process.env.PROXY_URL || null; // Ожидается формат socks5://login:pass@ip:port
-}
-
 const bot = new Telegraf(BOT_TOKEN);
 
-const mainKeyboard = {
-  reply_markup: {
-    keyboard: [["📱 Войти по номеру"], ["🔑 Войти по токену"]],
-    resize_keyboard: true
-  }
-};
+const mainKeyboard = Markup.keyboard([
+  ["📱 Войти по номеру", "🔑 Войти по токену"]
+]).resize();
 
-const cancelKeyboard = {
-  reply_markup: {
-    keyboard: [["❌ Отмена"]],
-    resize_keyboard: true
-  }
-};
+const cancelKeyboard = Markup.keyboard([
+  ["❌ Отмена"]
+]).resize();
 
 const userStates = {};
 
-// Функция для проверки токена с поддержкой прокси
 async function checkToken(accessToken, deviceParams) {
-    const clientOptions = {
+    const client = new WebMaxClient({
         token: accessToken,
         deviceType: deviceParams.deviceType || 'DESKTOP',
         saveToken: false,
-        debug: false,
-        ua: deviceParams.headerUserAgent || 'Mozilla/5.0',
+        debug: true,
+        ua: deviceParams.headerUserAgent || 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
         appVersion: deviceParams.appVersion || '26.2.3',
         buildNumber: deviceParams.buildNumber || 23185,
         osVersion: deviceParams.osVersion || 'macOS 14.5',
         screen: deviceParams.screen || '1440x900',
         timezone: deviceParams.timezone || 'UTC',
         locale: deviceParams.locale || 'ru-RU',
-        clientSessionId: deviceParams.clientSessionId || 17
-    };
-    
-    const proxy = getProxyUrl();
-    if (proxy) {
-        clientOptions.proxy = proxy;
-        console.log(`Использую прокси: ${proxy}`);
-    }
-
-    const client = new WebMaxClient(clientOptions);
+        clientSessionId: deviceParams.clientSessionId || 17,
+        deviceId: deviceParams.deviceId || '581a9ea526a673bd'
+    });
 
     try {
         await client.start();
+        const me = await client.getMe();
         await client.stop();
-        return { valid: true, info: 'Статус: Вход выполнен успешно' };
+        return { valid: true, info: `ID: ${me?.id || 'N/A'}\nИмя: ${me?.first_name || 'N/A'}` };
     } catch (error) {
         await client.stop();
         return { valid: false, info: `Ошибка: ${error.message}` };
@@ -64,12 +44,12 @@ async function checkToken(accessToken, deviceParams) {
 
 bot.start((ctx) => {
     userStates[ctx.chat.id] = { state: "menu" };
-    return ctx.reply("🔐 **MAX Account Validator**\n\nВыберите способ входа:", mainKeyboard);
+    return ctx.reply("🔐 **MAX Account Validator**\n\nВыберите способ входа:", { ...mainKeyboard, parse_mode: "Markdown" });
 });
 
 bot.on('text', async (ctx) => {
     const chatId = ctx.chat.id;
-    const text = ctx.message.text;
+    const text = ctx.message?.text?.trim();
     const state = userStates[chatId]?.state;
 
     if (text === "❌ Отмена") {
@@ -107,21 +87,20 @@ bot.on('text', async (ctx) => {
         try {
             deviceParams = JSON.parse(text);
         } catch (e) {
-            return ctx.reply("❌ Неверный формат JSON. Попробуйте еще раз.", cancelKeyboard);
+            return ctx.reply("❌ Неверный формат JSON.", cancelKeyboard);
         }
-        
+
         const msg = await ctx.reply("🔍 Выполняю вход в аккаунт...");
         const result = await checkToken(accessToken, deviceParams);
-        
+
         if (result.valid) {
             await ctx.telegram.editMessageText(chatId, msg.message_id, undefined,
                 `🟢 **АККАУНТ ЖИВОЙ!**\n\n\`\`\`\n${result.info}\n\`\`\``,
-                { parse_mode: "Markdown", ...mainKeyboard }
+                { parse_mode: "Markdown" }
             );
         } else {
             await ctx.telegram.editMessageText(chatId, msg.message_id, undefined,
-                `🔴 **АККАУНТ МЁРТВ**\n\n${result.info}`,
-                mainKeyboard
+                `🔴 **АККАУНТ МЁРТВ**\n\n${result.info}`
             );
         }
         delete userStates[chatId];
