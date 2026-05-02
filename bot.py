@@ -22,11 +22,11 @@ HEADERS = {
     "Referer": "https://max.ru/auth/login"
 }
 
-# ============ ПРОВЕРКА ТОКЕНА ============
 
 def check_token(access_token):
     try:
-        resp = requests.post(MAX_CHECK_TOKEN_URL, headers=HEADERS, json={"token": access_token}, timeout=15)
+        url = f"{MAX_CHECK_TOKEN_URL}?token={access_token}"
+        resp = requests.get(url, headers=HEADERS, timeout=15)
         logging.info(f"Status: {resp.status_code} | Response: {resp.text[:200]}")
         if resp.status_code == 200:
             data = resp.json()
@@ -44,7 +44,6 @@ def check_token(access_token):
     except Exception as e:
         return False, f"Ошибка соединения: {e}"
 
-# ============ SMS-ВХОД ============
 
 def request_sms_code(phone):
     try:
@@ -62,6 +61,7 @@ def request_sms_code(phone):
     except Exception as e:
         return False, None, f"Ошибка: {e}"
 
+
 def confirm_code(phone, code, session_id):
     try:
         resp = requests.post(MAX_CONFIRM_CODE_URL, headers=HEADERS, json={"phone": phone, "code": code, "session_id": session_id}, timeout=15)
@@ -76,24 +76,24 @@ def confirm_code(phone, code, session_id):
     except Exception as e:
         return False, None, f"Ошибка: {e}"
 
-# ============ КЛАВИАТУРЫ ============
 
 def main_keyboard():
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=1)
     markup.add("📱 Войти по номеру", "🔑 Войти по токену")
     return markup
 
+
 def cancel_keyboard():
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=1)
     markup.add("❌ Отмена")
     return markup
 
-# ============ ОБРАБОТЧИКИ ============
 
 @bot.message_handler(commands=['start'])
 def start(message):
     user_states.pop(message.chat.id, None)
     bot.reply_to(message, "🔐 **MAX Account Validator**\n\nВыберите способ входа:", parse_mode="Markdown", reply_markup=main_keyboard())
+
 
 @bot.message_handler(func=lambda m: True)
 def handle_message(message):
@@ -120,7 +120,7 @@ def handle_message(message):
         phone = text.replace(" ", "").replace("-", "").replace("(", "").replace(")", "")
         if not phone.startswith("+"):
             phone = "+7" + phone.lstrip("87")
-        bot.reply_to(message, f"📱 Запрашиваю SMS-код...")
+        bot.reply_to(message, "📱 Запрашиваю SMS-код...")
         success, session_id, msg = request_sms_code(phone)
         if success:
             user_states[chat_id] = {"state": "waiting_code", "phone": phone, "session_id": session_id}
@@ -159,6 +159,7 @@ def handle_message(message):
         else:
             bot.reply_to(message, f"🔴 {info}", reply_markup=main_keyboard())
         user_states.pop(chat_id, None)
+
 
 if __name__ == "__main__":
     print("🤖 MAX Validator запущен...")
