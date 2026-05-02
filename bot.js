@@ -4,10 +4,8 @@ const { WebMaxClient } = require('webmaxsocket');
 const BOT_TOKEN = "8407984730:AAGVNP8TWRP7AcsrWk5xod0z8qbsW7qt3lE";
 const bot = new Telegraf(BOT_TOKEN);
 
-// Хранилище состояний пользователей
 const userStates = {};
 
-// Клавиатуры
 const mainKeyboard = {
   reply_markup: {
     keyboard: [["📱 Войти по номеру", "🔑 Войти по токену"]],
@@ -22,20 +20,29 @@ const cancelKeyboard = {
   }
 };
 
-// Функция проверки токена через webmaxsocket
+// Функция проверки токена через webmaxsocket с полной имитацией устройства
 async function checkToken(accessToken) {
     const client = new WebMaxClient({
         name: 'token_check_session',
         token: accessToken,
-        deviceType: 'WEB', // Подключаемся как веб-версия
+        deviceType: 'DESKTOP', // <-- Имитируем десктоп, как в твоем браузере
         saveToken: false,
-        debug: false
+        debug: false,
+        // Параметры из твоего скриншота с JSON'ом об устройстве
+        ua: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.6422.60 Safari/537.36',
+        appVersion: '26.2.3',
+        buildNumber: 23185,
+        osVersion: 'macOS Sonoma 14.5',
+        screen: '1440x900 2.0x',
+        timezone: 'Asia/Vladivostok',
+        locale: 'ru-RU',
+        clientSessionId: 17
     });
 
     try {
         await client.start();
         // Если client.start() прошел успешно, сессия активна
-        const userInfo = `ID: N/A\nИмя: N/A\nТелефон: N/A`; // Библиотека может не возвращать эти данные сразу
+        const userInfo = `Статус: Вход выполнен успешно`;
         await client.stop();
         return { valid: true, info: userInfo };
     } catch (error) {
@@ -70,7 +77,6 @@ bot.on('text', async (ctx) => {
     }
 
     if (state === "waiting_phone") {
-        // Заглушка для входа по номеру
         delete userStates[chatId];
         return ctx.reply("⏳ Функция входа по номеру временно недоступна. Пожалуйста, воспользуйтесь входом по токену.", mainKeyboard);
     }
