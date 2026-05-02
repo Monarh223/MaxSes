@@ -1,7 +1,9 @@
+import asyncio
 import telebot
 from telebot import types
 import logging
-import requests
+import json
+import websockets
 
 BOT_TOKEN = "8407984730:AAGVNP8TWRP7AcsrWk5xod0z8qbsW7qt3lE"
 
@@ -10,7 +12,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 user_states = {}
 
-MAX_TOKEN_LOGIN_URL = "https://max.ru/api/auth/token_login"
+MAX_WS_URL = "wss://max.ru/ws"
 MAX_REQUEST_CODE_URL = "https://max.ru/api/auth/request_code"
 MAX_CONFIRM_CODE_URL = "https://max.ru/api/auth/confirm_code"
 
@@ -23,37 +25,31 @@ HEADERS = {
 }
 
 
-def check_token(access_token):
+async def check_token_ws(access_token):
     """
-    Проверяет токен через веб-эндпоинт MAX.
-    Имитирует вход по токену как на сайте max.ru.
+    Проверяет токен через WebSocket (десктопный протокол MAX).
     """
     try:
-        resp = requests.post(
-            MAX_TOKEN_LOGIN_URL,
-            headers=HEADERS,
-            json={"token": access_token},
-            timeout=15
-        )
-        logging.info(f"Status: {resp.status_code} | Response: {resp.text[:300]}")
-        
-        if resp.status_code == 200:
-            data = resp.json()
-            if data.get("success") or data.get("access_token"):
+        async with websockets.connect(MAX_WS_URL, extra_headers={"User-Agent": HEADERS["User-Agent"]}, timeout=20) as ws:
+            # Отправляем авторизационный пакет
+            auth_packet = json.dumps({
+                "op": "auth",
+                "token": access_token
+            })
+            await ws.send(auth_packet)
+            
+            # Ждём ответ
+            response = await asyncio.wait_for(ws.recv(), timeout=10)
+            data = json.loads(response)
+            
+            if data.get("status") == "ok" or data.get("type") == "auth_ok":
                 user = data.get("user", {})
                 info = f"ID: {user.get('id', 'N/A')}\nИмя: {user.get('first_name', 'N/A')} {user.get('last_name', '')}\nТелефон: {user.get('phone', 'N/A')}"
                 return True, info
-            return False, data.get("error", "Токен не принят")
-        elif resp.status_code == 401:
-            return False, "Токен недействителен"
-        elif resp.status_code == 403:
-            return False, "Токен заблокирован"
-        elif resp.status_code == 404:
-            return False, "Эндпоинт не найден. Нужен другой URL."
-        else:
-            return False, f"Ошибка сервера: {resp.status_code}"
+            else:
+                return False, data.get("error", "Токен не принят")
     except Exception as e:
-        return False, f"Ошибка соединения: {e}"
+        return False, f"Ошибка соединения: {str(e)}"
 
 
 def request_sms_code(phone):
@@ -161,8 +157,12 @@ def handle_message(message):
         if len(access_token) < 50:
             bot.reply_to(message, "❌ Токен слишком короткий.", reply_markup=cancel_keyboard())
             return
-        bot.reply_to(message, "🔍 Проверяю токен...")
-        valid, info = check_token(access_token)
+        bot.reply_to(message, "🔍 Проверяю токен через WebSocket...")
+        # Запускаем асинхронную проверку
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        valid, info = loop.run_until_complete(check_token_ws(access_token))
+        loop.close()
         if valid:
             bot.reply_to(message, f"🟢 **СЕССИЯ АКТИВНА!**\n\n```\n{info}\n```", parse_mode="Markdown", reply_markup=main_keyboard())
             with open("valid_accounts.txt", "a") as f:
