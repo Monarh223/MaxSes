@@ -6,7 +6,7 @@ from telebot.types import ReplyKeyboardMarkup, KeyboardButton
 from pymax import MaxClient
 from pymax.payloads import UserAgentPayload
 
-BOT_TOKEN = "8407984730:AAGVNP8TWRP7AcsrWk5xod0z8qbsW7qt3lE"
+BOT_TOKEN = "8407984730:AAGuKV9CD2VC99Jl2oeL5qFnGsMj5mufWvE"
 
 bot = TeleBot(BOT_TOKEN)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -104,7 +104,6 @@ def handle_message(message):
             return
 
         msg = bot.reply_to(message, "🔍 Выполняю вход в аккаунт...")
-        # Запускаем асинхронно, чтобы не блокировать бота
         async def process():
             valid, info = await login_via_token(access_token, device_params)
             if valid:
