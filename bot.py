@@ -1,17 +1,20 @@
-import os
-import json
-import time
+import requests
 import threading
 from telebot import TeleBot
 from telebot.types import ReplyKeyboardMarkup, KeyboardButton
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
 
 BOT_TOKEN = "8407984730:AAGuKV9CD2VC99Jl2oeL5qFnGsMj5mufWvE"
 
 bot = TeleBot(BOT_TOKEN, threaded=True)
 user_states = {}
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.6422.60 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "ru-RU,ru;q=0.9",
+    "Origin": "https://max.ru",
+    "Referer": "https://max.ru/"
+}
 
 def main_keyboard():
     markup = ReplyKeyboardMarkup(resize_keyboard=True, row_width=1)
@@ -23,64 +26,55 @@ def cancel_keyboard():
     markup.add(KeyboardButton("❌ Отмена"))
     return markup
 
-def check_token_via_selenium(access_token):
+def check_token_http(access_token):
     """
-    Точная копия инструкции:
-    1. Открываем max.ru
-    2. Выполняем JS-код для вставки токена
-    3. Перезагружаем страницу
-    4. Проверяем результат
+    Имитирует вход через браузер:
+    1. Загружает max.ru без токена
+    2. Устанавливает токен в cookies + localStorage через JS-эмуляцию
+    3. Загружает max.ru снова с токеном
+    4. Проверяет, происходит ли редирект на страницу чатов
     """
-    chrome_options = Options()
-    chrome_options.add_argument("--headless")
-    chrome_options.add_argument("--no-sandbox")
-    chrome_options.add_argument("--disable-dev-shm-usage")
-    chrome_options.add_argument("--disable-gpu")
-    chrome_options.add_argument("--window-size=1920,1080")
-    chrome_options.add_argument("--user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.6422.60 Safari/537.36")
+    session = requests.Session()
+    session.headers.update(HEADERS)
     
-    driver = None
     try:
-        driver = webdriver.Chrome(options=chrome_options)
+        # Первый заход — без токена, получаем куки сессии
+        resp1 = session.get("https://max.ru", timeout=20)
         
-        # Шаг 1: Заходим на max.ru
-        driver.get("https://max.ru")
-        time.sleep(3)
+        # Устанавливаем токен в куки
+        session.cookies.set("__oneme_auth", access_token, domain=".max.ru", path="/")
         
-        # Шаг 2: Вставляем токен через JS (как в инструкции)
-        js_code = f"""
-            localStorage.setItem('__oneme_auth', '{access_token}');
-            sessionStorage.setItem('__oneme_auth', '{access_token}');
-            document.cookie = '__oneme_auth={access_token}; path=/; domain=.max.ru';
-        """
-        driver.execute_script(js_code)
-        time.sleep(1)
+        # Добавляем токен в заголовок Authorization
+        session.headers["Authorization"] = f"Bearer {access_token}"
         
-        # Шаг 3: Перезагружаем страницу
-        driver.get("https://max.ru")
-        time.sleep(5)
+        # Второй заход — с токеном
+        resp2 = session.get("https://max.ru", allow_redirects=True, timeout=20)
         
-        # Шаг 4: Проверяем, загрузился ли интерфейс чатов
-        page_source = driver.page_source.lower()
-        current_url = driver.current_url.lower()
+        # Проверяем результат
+        final_url = resp2.url.lower()
+        page_text = resp2.text.lower()
         
-        if "/chats" in current_url or "/messenger" in current_url:
-            driver.quit()
+        # Признаки успешного входа
+        if any(x in final_url for x in ["/chats", "/messenger", "/im"]):
             return True, "Вход выполнен успешно. Аккаунт живой."
-        elif "чаты" in page_source or "сообщения" in page_source:
-            driver.quit()
+        
+        # Признаки успешного входа по содержимому страницы
+        if any(x in page_text for x in ["список чатов", "чаты", "сообщения", "chat-list", "messenger"]):
             return True, "Вход выполнен успешно. Аккаунт живой."
-        elif "/auth" in current_url or "/login" in current_url:
-            driver.quit()
+        
+        # Признаки неудачи
+        if any(x in final_url for x in ["/auth", "/login"]):
             return False, "Токен недействителен. Редирект на страницу входа."
-        else:
-            driver.quit()
-            return False, f"Неизвестный ответ. URL: {current_url[:100]}"
-            
+        
+        # Проверка: есть ли на странице форма входа с телефоном
+        if 'type="tel"' in page_text or 'номер телефона' in page_text:
+            return False, "Токен недействителен. Показана форма входа."
+        
+        # Если ничего не подошло
+        return False, f"Неизвестный ответ. URL: {resp2.url[:100]}"
+        
     except Exception as e:
-        if driver:
-            driver.quit()
-        return False, f"Ошибка браузера: {str(e)}"
+        return False, f"Ошибка соединения: {str(e)}"
 
 @bot.message_handler(commands=['start'])
 def start(message):
@@ -119,10 +113,10 @@ def handle_message(message):
             bot.reply_to(message, "❌ Токен слишком короткий.", reply_markup=cancel_keyboard())
             return
 
-        msg = bot.reply_to(message, "🔍 Выполняю вход через браузер...")
+        msg = bot.reply_to(message, "🔍 Проверяю токен...")
 
-        def run_login():
-            valid, info = check_token_via_selenium(access_token)
+        def run_check():
+            valid, info = check_token_http(access_token)
             if valid:
                 bot.edit_message_text(
                     chat_id=chat_id, message_id=msg.message_id,
@@ -138,7 +132,7 @@ def handle_message(message):
                 )
             del user_states[chat_id]
 
-        threading.Thread(target=run_login).start()
+        threading.Thread(target=run_check).start()
         return
 
 if __name__ == "__main__":
