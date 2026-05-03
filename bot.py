@@ -1,15 +1,12 @@
 import os
-import asyncio
 import json
 import logging
 import threading
 from telebot import TeleBot
 from telebot.types import ReplyKeyboardMarkup, KeyboardButton
-from pymax import MaxClient
-from pymax.payloads import UserAgentPayload
+from playwright.sync_api import sync_playwright
 
 BOT_TOKEN = "8407984730:AAGuKV9CD2VC99Jl2oeL5qFnGsMj5mufWvE"
-PROXY_URL = os.environ.get("PROXY_URL", None)  # Берётся из переменных Railway
 
 bot = TeleBot(BOT_TOKEN, threaded=True)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -25,43 +22,53 @@ def cancel_keyboard():
     markup.add(KeyboardButton("❌ Отмена"))
     return markup
 
-def do_login(access_token, device_params):
-    async def _login():
-        ua = UserAgentPayload(
-            device_type=device_params.get("deviceType", "DESKTOP"),
-            app_version=device_params.get("appVersion", "26.2.3"),
-            system_version=device_params.get("osVersion", "macOS Sonoma 14.5"),
-            screen=device_params.get("screen", "1440x900 2.0x"),
-            timezone=device_params.get("timezone", "Asia/Vladivostok"),
-            locale=device_params.get("locale", "ru-RU"),
-            device_id=device_params.get("deviceId", "581a9ea526a673bd"),
-            client_session_id=device_params.get("clientSessionId", 17),
-            user_agent=device_params.get("headerUserAgent", 
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.6422.60 Safari/537.36")
-        )
-
-        client = MaxClient(
-            token=access_token,
-            work_dir="cache",
-            headers=ua,
-            proxy=PROXY_URL
-        )
-
-        try:
-            await client.start()
-            me = client.me
-            info = f"ID: {me.id}\nИмя: {me.firstname} {me.lastname or ''}\nТелефон: {me.phone}"
-            await client.stop()
-            return True, info
-        except Exception as e:
-            await client.stop()
-            return False, f"Ошибка: {e}"
-
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    result = loop.run_until_complete(_login())
-    loop.close()
-    return result
+def check_token_via_browser(access_token):
+    """
+    Входит в MAX через браузер (как в инструкции).
+    1. Открывает max.ru
+    2. Вставляет токен в localStorage
+    3. Перезагружает страницу
+    4. Проверяет, загрузился ли интерфейс чатов
+    """
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context()
+            page = context.new_page()
+            
+            # Шаг 1: Заходим на max.ru
+            page.goto("https://max.ru", wait_until="domcontentloaded", timeout=30000)
+            
+            # Шаг 2: Вставляем токен в localStorage
+            page.evaluate(f"""
+                localStorage.setItem('__oneme_auth', '{access_token}');
+            """)
+            
+            # Шаг 3: Перезагружаем страницу
+            page.goto("https://max.ru", wait_until="domcontentloaded", timeout=30000)
+            page.wait_for_timeout(5000)  # ждём загрузку интерфейса
+            
+            # Шаг 4: Проверяем, есть ли интерфейс чатов
+            # Если токен рабочий — на странице будет список чатов или поле поиска
+            chat_list = page.query_selector('[data-testid="chat-list"]')
+            search_input = page.query_selector('input[placeholder*="Поиск"]')
+            login_form = page.query_selector('input[type="tel"]')  # форма входа с телефоном
+            
+            if chat_list or search_input:
+                # Есть интерфейс чатов — аккаунт живой
+                browser.close()
+                return True, "Вход выполнен успешно. Аккаунт живой."
+            elif login_form:
+                # Показана форма входа — токен не сработал
+                browser.close()
+                return False, "Токен недействителен. Показана форма входа."
+            else:
+                # Непонятное состояние
+                browser.close()
+                return False, "Не удалось определить статус. Проверьте токен вручную."
+                
+    except Exception as e:
+        return False, f"Ошибка браузера: {str(e)}"
 
 @bot.message_handler(commands=['start'])
 def start(message):
@@ -80,12 +87,12 @@ def handle_message(message):
         return
 
     if text == "📱 Войти по номеру":
-        user_states[chat_id] = {"state": "waiting_phone", "mode": "phone"}
+        user_states[chat_id] = {"state": "waiting_phone"}
         bot.reply_to(message, "📱 Введите номер:\n`+7XXXXXXXXXX`", parse_mode="Markdown", reply_markup=cancel_keyboard())
         return
 
     if text == "🔑 Войти по токену":
-        user_states[chat_id] = {"state": "waiting_token", "mode": "token"}
+        user_states[chat_id] = {"state": "waiting_token"}
         bot.reply_to(message, "🔑 Вставьте токен:", reply_markup=cancel_keyboard())
         return
 
@@ -99,25 +106,11 @@ def handle_message(message):
         if len(access_token) < 50:
             bot.reply_to(message, "❌ Токен слишком короткий.", reply_markup=cancel_keyboard())
             return
-        user_states[chat_id] = {"state": "waiting_json", "token": access_token}
-        bot.reply_to(message, "📲 Теперь отправьте JSON с параметрами устройства одной строкой.", reply_markup=cancel_keyboard())
-        return
 
-    if state == "waiting_json":
-        access_token = user_states[chat_id]["token"]
-        try:
-            device_params = json.loads(text)
-        except json.JSONDecodeError:
-            bot.reply_to(message, "❌ Неверный JSON. Попробуйте ещё раз.", reply_markup=cancel_keyboard())
-            return
-        if not device_params.get("deviceType") or not device_params.get("clientSessionId"):
-            bot.reply_to(message, "❌ В JSON обязательно нужны поля *deviceType* и *clientSessionId*.", parse_mode="Markdown", reply_markup=cancel_keyboard())
-            return
-
-        msg = bot.reply_to(message, "🔍 Выполняю вход в аккаунт...")
+        msg = bot.reply_to(message, "🔍 Выполняю вход через браузер...")
 
         def run_login():
-            valid, info = do_login(access_token, device_params)
+            valid, info = check_token_via_browser(access_token)
             if valid:
                 bot.edit_message_text(
                     chat_id=chat_id, message_id=msg.message_id,
