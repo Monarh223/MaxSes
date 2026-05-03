@@ -1,2 +1,1 @@
-worker: python bot.py && playwright 
-install chromium
+worker: bash -c "playwright install chromium && python bot.py"
