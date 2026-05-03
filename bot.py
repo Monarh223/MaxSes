@@ -1,16 +1,19 @@
-import os
-import json
-import logging
+import requests
 import threading
 from telebot import TeleBot
 from telebot.types import ReplyKeyboardMarkup, KeyboardButton
-from playwright.sync_api import sync_playwright
 
 BOT_TOKEN = "8407984730:AAGuKV9CD2VC99Jl2oeL5qFnGsMj5mufWvE"
 
 bot = TeleBot(BOT_TOKEN, threaded=True)
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 user_states = {}
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.6422.60 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Origin": "https://max.ru",
+    "Referer": "https://max.ru/"
+}
 
 def main_keyboard():
     markup = ReplyKeyboardMarkup(resize_keyboard=True, row_width=1)
@@ -22,53 +25,26 @@ def cancel_keyboard():
     markup.add(KeyboardButton("❌ Отмена"))
     return markup
 
-def check_token_via_browser(access_token):
+def check_token(access_token):
     """
-    Входит в MAX через браузер (как в инструкции).
-    1. Открывает max.ru
-    2. Вставляет токен в localStorage
-    3. Перезагружает страницу
-    4. Проверяет, загрузился ли интерфейс чатов
+    Проверяет токен через HTTP. Загружает главную страницу MAX с токеном,
+    и смотрит — редиректит ли на /chats или остаётся на /auth/login.
     """
+    session = requests.Session()
+    session.headers.update(HEADERS)
+    session.cookies.set("__oneme_auth", access_token, domain=".max.ru")
+    
     try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            context = browser.new_context()
-            page = context.new_page()
-            
-            # Шаг 1: Заходим на max.ru
-            page.goto("https://max.ru", wait_until="domcontentloaded", timeout=30000)
-            
-            # Шаг 2: Вставляем токен в localStorage
-            page.evaluate(f"""
-                localStorage.setItem('__oneme_auth', '{access_token}');
-            """)
-            
-            # Шаг 3: Перезагружаем страницу
-            page.goto("https://max.ru", wait_until="domcontentloaded", timeout=30000)
-            page.wait_for_timeout(5000)  # ждём загрузку интерфейса
-            
-            # Шаг 4: Проверяем, есть ли интерфейс чатов
-            # Если токен рабочий — на странице будет список чатов или поле поиска
-            chat_list = page.query_selector('[data-testid="chat-list"]')
-            search_input = page.query_selector('input[placeholder*="Поиск"]')
-            login_form = page.query_selector('input[type="tel"]')  # форма входа с телефоном
-            
-            if chat_list or search_input:
-                # Есть интерфейс чатов — аккаунт живой
-                browser.close()
-                return True, "Вход выполнен успешно. Аккаунт живой."
-            elif login_form:
-                # Показана форма входа — токен не сработал
-                browser.close()
-                return False, "Токен недействителен. Показана форма входа."
-            else:
-                # Непонятное состояние
-                browser.close()
-                return False, "Не удалось определить статус. Проверьте токен вручную."
-                
+        resp = session.get("https://max.ru", allow_redirects=True, timeout=20)
+        
+        if "/chats" in resp.url or "/messenger" in resp.url:
+            return True, "Вход выполнен успешно. Аккаунт живой."
+        elif "/auth" in resp.url or "/login" in resp.url:
+            return False, "Токен недействителен. Редирект на страницу входа."
+        else:
+            return False, f"Неизвестный ответ. URL: {resp.url}"
     except Exception as e:
-        return False, f"Ошибка браузера: {str(e)}"
+        return False, f"Ошибка: {e}"
 
 @bot.message_handler(commands=['start'])
 def start(message):
@@ -107,17 +83,17 @@ def handle_message(message):
             bot.reply_to(message, "❌ Токен слишком короткий.", reply_markup=cancel_keyboard())
             return
 
-        msg = bot.reply_to(message, "🔍 Выполняю вход через браузер...")
+        msg = bot.reply_to(message, "🔍 Проверяю токен...")
 
-        def run_login():
-            valid, info = check_token_via_browser(access_token)
+        def run_check():
+            valid, info = check_token(access_token)
             if valid:
                 bot.edit_message_text(
                     chat_id=chat_id, message_id=msg.message_id,
                     text=f"🟢 **АККАУНТ ЖИВОЙ!**\n\n```\n{info}\n```",
                     parse_mode="Markdown"
                 )
-                with open("valid_accounts.txt", "a") as f:
+                with open("valid_accounts.txt", "a", encoding="utf-8") as f:
                     f.write(f"[TOKEN] {access_token[:50]}... | {info}\n")
             else:
                 bot.edit_message_text(
@@ -126,7 +102,7 @@ def handle_message(message):
                 )
             del user_states[chat_id]
 
-        threading.Thread(target=run_login).start()
+        threading.Thread(target=run_check).start()
         return
 
 if __name__ == "__main__":
