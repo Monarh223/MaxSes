@@ -96,10 +96,15 @@ def extract_code(text):
     m = re.search(r'\b(\d{4,8})\b', text)
     return m.group(1) if m else None
 
-# ---------- Глобальные клиенты ----------
+# ---------- Глобальные переменные ----------
 bot_client = None        # для личных сообщений (токен)
-user_client = None       # один авторизованный юзер-клиент (на весь бот, твой аккаунт)
+user_client = None       # авторизованный юзер-клиент (твой аккаунт)
 owner_id = None          # user_id владельца (кто прошёл /login)
+code_inputs = {}         # временные данные для ввода кода
+
+def code_keyboard():
+    return [[Button.inline(str(i), str(i).encode()) for i in row] for row in [[1,2,3],[4,5,6],[7,8,9]]] + \
+           [[Button.inline("0", b"0"), Button.inline("⌫", b"del"), Button.inline("✅", b"submit")]]
 
 # ---------- Единый обработчик для юзер-клиента ----------
 async def setup_user_listener():
@@ -168,7 +173,7 @@ async def setup_user_listener():
 
 # ---------- Обработчики бота (личные сообщения) ----------
 async def setup_bot_handlers():
-    global bot_client, owner_id, user_client
+    global bot_client, user_client, owner_id, code_inputs
 
     @bot_client.on(events.NewMessage(pattern='/start'))
     async def start_cmd(e):
@@ -176,7 +181,7 @@ async def setup_bot_handlers():
 
     @bot_client.on(events.NewMessage(pattern='/login (.+)'))
     async def login_cmd(e):
-        nonlocal owner_id, user_client
+        global user_client, owner_id, code_inputs
         uid = e.sender_id
         phone = clean_phone(e.pattern_match.group(1))
         if not phone:
@@ -185,12 +190,9 @@ async def setup_bot_handlers():
         await client.connect()
         try:
             await client.send_code_request(phone)
-            # временно сохраняем клиента
             user_client = client
             owner_id = uid
             db.save_session(uid, phone, "", "waiting_code")
-            # сохраняем состояние для ввода кода
-            global code_inputs
             code_inputs[uid] = {'code': '', 'phone': phone, 'attempts': 0}
             await e.reply(f"✅ Код отправлен на {phone}\nВведите код кнопками:", buttons=code_keyboard())
         except Exception as ex:
@@ -198,6 +200,7 @@ async def setup_bot_handlers():
 
     @bot_client.on(events.CallbackQuery())
     async def callback_handler(e):
+        global code_inputs, user_client, owner_id
         uid = e.sender_id
         if uid not in code_inputs:
             return await e.answer("Сначала /login", alert=True)
@@ -223,7 +226,7 @@ async def setup_bot_handlers():
                 sess = client.session.save()
                 me = await client.get_me()
                 db.save_session(uid, me.phone, sess, "authorized")
-                # перезапускаем слушатель юзера
+                owner_id = uid
                 await setup_user_listener()
                 await e.edit(f"✅ Вход! Аккаунт: {me.phone}\nSession: `{sess}`")
                 await e.client.send_message(uid, f"🔑 Сохраните session_string:\n`{sess}`")
@@ -246,6 +249,7 @@ async def setup_bot_handlers():
 
     @bot_client.on(events.NewMessage(pattern='/2fa (.+)'))
     async def twofa_cmd(e):
+        global user_client, owner_id
         uid = e.sender_id
         pwd = e.pattern_match.group(1)
         _, _, step = db.get_session(uid)
@@ -257,6 +261,7 @@ async def setup_bot_handlers():
             sess = client.session.save()
             me = await client.get_me()
             db.save_session(uid, me.phone, sess, "authorized")
+            owner_id = uid
             await setup_user_listener()
             await e.reply(f"✅ Вход с 2FA! Аккаунт: {me.phone}\nSession: `{sess}`")
         except Exception as ex:
@@ -290,18 +295,17 @@ async def setup_bot_handlers():
         await e.reply("📥 Отправьте файл .db")
         @bot_client.on(events.NewMessage(func=lambda m: m.sender_id == uid and m.file and m.file.name.endswith('.db')))
         async def do_imp(msg):
+            global user_client, owner_id
             path = f"/tmp/imp_{uid}.db"
             await msg.download_media(path)
             db.import_db(path)
             os.remove(path)
-            # перечитаем сессию
             sess, phone, _ = db.get_session(uid)
             if sess:
                 try:
                     cl = TelegramClient(StringSession(sess), API_ID, API_HASH)
                     await cl.connect()
                     if await cl.is_user_authorized():
-                        global user_client, owner_id
                         user_client = cl
                         owner_id = uid
                         await setup_user_listener()
@@ -315,6 +319,7 @@ async def setup_bot_handlers():
 
     @bot_client.on(events.NewMessage(pattern='/restore (.+)'))
     async def restore_cmd(e):
+        global user_client, owner_id
         uid = e.sender_id
         sess_str = e.pattern_match.group(1)
         try:
@@ -323,7 +328,6 @@ async def setup_bot_handlers():
             if await cl.is_user_authorized():
                 me = await cl.get_me()
                 db.save_session(uid, me.phone, sess_str, "authorized")
-                global user_client, owner_id
                 user_client = cl
                 owner_id = uid
                 await setup_user_listener()
@@ -354,7 +358,7 @@ async def restore_session_on_start():
                 owner_id = uid
                 await setup_user_listener()
                 print(f"[+] Сессия восстановлена для user {uid}")
-                return  # только одного пользователя поддерживаем
+                return  # только одного пользователя
             else:
                 print(f"[-] Сессия для {uid} невалидна")
         except Exception as e:
@@ -370,10 +374,6 @@ async def main():
     await setup_bot_handlers()
     print("✅ Бот запущен. Команды /set_source и /set_target работают в группах.")
     await bot_client.run_until_disconnected()
-
-code_inputs = {}
-code_keyboard = lambda: [[Button.inline(str(i), str(i).encode()) for i in row] for row in [[1,2,3],[4,5,6],[7,8,9]]] + \
-                         [[Button.inline("0", b"0"), Button.inline("⌫", b"del"), Button.inline("✅", b"submit")]]
 
 if __name__ == "__main__":
     asyncio.run(main())
