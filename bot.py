@@ -1,5 +1,5 @@
 # diamond_autovbiv.py
-# FINAL FIXED - StringSession + правильный запуск
+# USER-BOT VERSION — команды в группах обрабатываются авторизованным пользователем
 
 import os
 import asyncio
@@ -15,7 +15,7 @@ from telethon.sessions import StringSession
 # ========== КОНФИГ ==========
 API_ID = int(os.environ.get("API_ID", 0))
 API_HASH = os.environ.get("API_HASH", "")
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")  # Для личных команд и кнопок
 
 DB_PATH = "/app/diamond_data.db"
 BACKUP_DIR = "/app/backups"
@@ -157,9 +157,9 @@ class DiamondDB:
 
 db = DiamondDB()
 
-# ========== ОСНОВНОЙ БОТ ==========
+# ========== ОСНОВНОЙ БОТ (ДЛЯ ЛИЧНЫХ СООБЩЕНИЙ) ==========
 bot = None
-user_clients = {}
+user_clients = {}  # user_id -> TelegramClient (авторизованный пользователь)
 user_code_inputs = {}
 
 # ========== КЛАВИАТУРА ==========
@@ -207,6 +207,7 @@ def extract_code_from_text(text):
     match = re.search(r'\b(\d{4,8})\b', text)
     return match.group(1) if match else None
 
+# ========== СОЗДАНИЕ ПОЛЬЗОВАТЕЛЬСКОГО КЛИЕНТА И ОБРАБОТЧИКОВ ==========
 async def get_user_client(user_id, session_string=None):
     if user_id in user_clients:
         client = user_clients[user_id]
@@ -228,18 +229,78 @@ async def get_user_client(user_id, session_string=None):
         print(f"[ERROR] get_user_client: {e}")
         return None
 
-# ========== ОБРАБОТЧИКИ ==========
-async def setup_handlers():
+async def setup_user_handlers(user_id, client):
+    """Регистрирует обработчики для пользовательского клиента (групповые команды)"""
+    
+    @client.on(events.NewMessage(pattern='(?i)/set_source'))
+    async def source_cmd(event):
+        if event.is_group:
+            source_group = event.chat_id
+            _, target = db.get_groups(user_id)
+            db.set_groups(user_id, source_group, target)
+            await event.reply(f"✅ **ГРУППА-ИСТОЧНИК установлена!**\nБот будет следить за номерами и кодами здесь.")
+            # Уже слушатель source запущен в start_source_listener
+        else:
+            await event.reply("❌ Команда работает только в группе.")
+    
+    @client.on(events.NewMessage(pattern='(?i)/set_target'))
+    async def target_cmd(event):
+        if event.is_group:
+            target_group = event.chat_id
+            source, _ = db.get_groups(user_id)
+            db.set_groups(user_id, source, target_group)
+            await event.reply(f"✅ **ГРУППА-ЦЕЛЬ установлена!**\nСюда будут приходить номера и коды, здесь жду 'встал'.")
+            # Если уже есть источник, то слушатель уже работает
+        else:
+            await event.reply("❌ Команда работает только в группе.")
+    
+    # Можно также добавить команды /stats, /status в группах (опционально)
+    # Но они уже есть у бота в ЛС — достаточно.
+    
+    # Запускаем слушатель для источника (если он уже установлен в БД)
+    source, _ = db.get_groups(user_id)
+    if source:
+        await start_source_listener(user_id, client, source)
+
+async def start_source_listener(user_id, client, source_group_id):
+    """Слушает группу-источник на номера и коды (работает через пользовательского клиента)"""
+    @client.on(events.NewMessage(chats=source_group_id))
+    async def handle_source(event):
+        try:
+            if event.sender_id == (await client.get_me()).id:
+                return
+            text = event.raw_text.strip()
+            phone = extract_phone_from_text(text)
+            if phone:
+                db.add_pending_number(user_id, phone)
+                db.add_stat(user_id, phone, 'number_taken')
+                _, target = db.get_groups(user_id)
+                if target:
+                    await client.send_message(target, f"📱 НОМЕР: `{phone}`")
+                return
+            code = extract_code_from_text(text)
+            if code:
+                last = db.get_last_pending_number(user_id)
+                if last:
+                    db.update_pending_with_code(last, code)
+                    db.add_stat(user_id, last, 'code_taken')
+                    _, target = db.get_groups(user_id)
+                    if target:
+                        await client.send_message(target, f"🔢 КОД: `{code}`\nДля номера: `{last}`")
+        except Exception as e:
+            print(f"[ERROR] handle_source: {e}")
+
+# ========== ОБРАБОТЧИКИ БОТА (ЛИЧНЫЕ СООБЩЕНИЯ) ==========
+async def setup_bot_handlers():
     global bot
     
     @bot.on(events.NewMessage(pattern='/start'))
     async def start_cmd(event):
         await event.reply("""
-💎 DIAMOND AUTOVBIV BOT (StringSession)
-
+💎 DIAMOND AUTOVBIV BOT (User-Bot)
 /login +79991234567
-/set_source — в группе с номерами/кодами
-/set_target — в группе для слива/"встал"
+/set_source — в группе (через ваш аккаунт)
+/set_target — в группе
 /stats — статистика
 /status — статус
 /export — выгрузить БД
@@ -280,9 +341,8 @@ async def setup_handlers():
             phone = (await client.get_me()).phone
             db.save_session(user_id, phone, session_string, "authorized")
             await event.reply(f"✅ Вход выполнен!\nАккаунт: {phone}\n\n🔑 Session string:\n`{session_string}`")
-            source, target = db.get_groups(user_id)
-            if source:
-                asyncio.create_task(start_source_listener(user_id, client, source))
+            # Настраиваем обработчики пользователя
+            await setup_user_handlers(user_id, client)
         except Exception as e:
             await event.reply(f"❌ Ошибка: {str(e)}")
     
@@ -324,15 +384,14 @@ async def setup_handlers():
                 await event.edit(
                     f"✅ **Вход выполнен!**\n\n📱 Аккаунт: `{user_phone}`\n\n"
                     f"🔑 **Session string (сохраните):**\n`{session_string}`\n\n"
-                    f"Теперь /set_source и /set_target"
+                    f"Теперь в группах напишите /set_source и /set_target"
                 )
                 await bot.send_message(
                     user_id,
                     f"🔐 **Session string для {user_phone}:**\n\n`{session_string}`\n\nСохраните!"
                 )
-                source, target = db.get_groups(user_id)
-                if source:
-                    asyncio.create_task(start_source_listener(user_id, client, source))
+                # Настраиваем обработчики пользователя
+                await setup_user_handlers(user_id, client)
                 del user_code_inputs[user_id]
             except PhoneCodeInvalidError:
                 user_code_inputs[user_id]['attempts'] += 1
@@ -349,40 +408,6 @@ async def setup_handlers():
             except Exception as e:
                 await event.edit(f"❌ {str(e)}")
                 del user_code_inputs[user_id]
-    
-    @bot.on(events.NewMessage(pattern='(?i)/set_source'))
-    async def set_source_cmd(event):
-        user_id = event.sender_id
-        if event.is_group:
-            source_group = event.chat_id
-            _, target_group = db.get_groups(user_id)
-            db.set_groups(user_id, source_group, target_group)
-            await event.reply(f"✅ **ГРУППА-ИСТОЧНИК установлена!**")
-            if db.is_authorized(user_id):
-                session_string, _, _ = db.get_session(user_id)
-                if session_string:
-                    client = await get_user_client(user_id, session_string)
-                    if client:
-                        asyncio.create_task(start_source_listener(user_id, client, source_group))
-        else:
-            await event.reply("❌ Команда работает только в группе.")
-    
-    @bot.on(events.NewMessage(pattern='(?i)/set_target'))
-    async def set_target_cmd(event):
-        user_id = event.sender_id
-        if event.is_group:
-            target_group = event.chat_id
-            source_group, _ = db.get_groups(user_id)
-            db.set_groups(user_id, source_group, target_group)
-            await event.reply(f"✅ **ГРУППА-ЦЕЛЬ установлена!**")
-            if source_group and db.is_authorized(user_id):
-                session_string, _, _ = db.get_session(user_id)
-                if session_string:
-                    client = await get_user_client(user_id, session_string)
-                    if client:
-                        asyncio.create_task(start_source_listener(user_id, client, source_group))
-        else:
-            await event.reply("❌ Команда работает только в группе.")
     
     @bot.on(events.NewMessage(pattern='/stats'))
     async def stats_cmd(event):
@@ -422,9 +447,87 @@ async def setup_handlers():
         db.conn.commit()
         await event.reply("✅ Сброшено. Используйте /login")
     
-    # ========== ЛОГИКА ПЕРЕХВАТА ==========
-    async def start_source_listener(user_id, client, source_group_id):
-        @client.on(events.NewMessage(chats=source_group_id))
+    # Обработчик для "встал" в целевой группе (через бота? Но лучше тоже через пользователя)
+    # Однако бот не видит сообщений в группах, поэтому этот обработчик нужно перенести на пользовательского клиента.
+    # Добавим его в setup_user_handlers.
+    
+    # Также нужно, чтобы пользовательский клиент читал сообщения в ТАРГЕТ группе и реагировал на "встал".
+    # Это реализуем внутри setup_user_handlers.
+    
+# Дописываем в setup_user_handlers обработчик для "встал"
+async def setup_user_handlers_full(user_id, client):
+    # Ставим обработчик на все сообщения (будет фильтровать по целевой группе)
+    @client.on(events.NewMessage())
+    async def handle_target(event):
+        try:
+            _, target = db.get_groups(user_id)
+            if not target or event.chat_id != target:
+                return
+            text = event.raw_text.lower()
+            if 'встал' in text or 'успех' in text:
+                phone = extract_phone_from_text(text)
+                if phone:
+                    db.mark_success(phone)
+                    db.add_stat(user_id, phone, 'success')
+                    await event.reply(f"✅ {phone} — ВСТАЛ!")
+                else:
+                    last = db.get_last_pending_number(user_id)
+                    if last:
+                        db.mark_success(last)
+                        db.add_stat(user_id, last, 'success')
+                        await event.reply(f"✅ {last} — ВСТАЛ!")
+        except Exception as e:
+            print(f"[ERROR] handle_target: {e}")
+    
+    # Переиспользуем предыдущую функцию для команд и источника
+    await setup_user_handlers(user_id, client)
+
+# Обновим вызов setup_user_handlers на setup_user_handlers_full
+async def setup_user_handlers(user_id, client):
+    # Регистрируем команды /set_source, /set_target
+    @client.on(events.NewMessage(pattern='(?i)/set_source'))
+    async def source_cmd(event):
+        if event.is_group:
+            source_group = event.chat_id
+            _, target = db.get_groups(user_id)
+            db.set_groups(user_id, source_group, target)
+            await event.reply(f"✅ ГРУППА-ИСТОЧНИК установлена!")
+    
+    @client.on(events.NewMessage(pattern='(?i)/set_target'))
+    async def target_cmd(event):
+        if event.is_group:
+            target_group = event.chat_id
+            source, _ = db.get_groups(user_id)
+            db.set_groups(user_id, source, target_group)
+            await event.reply(f"✅ ГРУППА-ЦЕЛЬ установлена!")
+    
+    # Обработчик для "встал"
+    @client.on(events.NewMessage())
+    async def handle_target(event):
+        try:
+            _, target = db.get_groups(user_id)
+            if not target or event.chat_id != target:
+                return
+            text = event.raw_text.lower()
+            if 'встал' in text or 'успех' in text:
+                phone = extract_phone_from_text(text)
+                if phone:
+                    db.mark_success(phone)
+                    db.add_stat(user_id, phone, 'success')
+                    await event.reply(f"✅ {phone} — ВСТАЛ!")
+                else:
+                    last = db.get_last_pending_number(user_id)
+                    if last:
+                        db.mark_success(last)
+                        db.add_stat(user_id, last, 'success')
+                        await event.reply(f"✅ {last} — ВСТАЛ!")
+        except Exception as e:
+            print(f"[ERROR] handle_target: {e}")
+    
+    # Запускаем слушатель источника, если он уже сохранён
+    source, _ = db.get_groups(user_id)
+    if source:
+        @client.on(events.NewMessage(chats=source))
         async def handle_source(event):
             try:
                 if event.sender_id == (await client.get_me()).id:
@@ -449,29 +552,6 @@ async def setup_handlers():
                             await client.send_message(target, f"🔢 КОД: `{code}`\nДля номера: `{last}`")
             except Exception as e:
                 print(f"[ERROR] handle_source: {e}")
-    
-    @bot.on(events.NewMessage())
-    async def handle_target(event):
-        try:
-            user_id = event.sender_id
-            _, target = db.get_groups(user_id)
-            if not target or event.chat_id != target:
-                return
-            text = event.raw_text.lower()
-            if 'встал' in text or 'успех' in text:
-                phone = extract_phone_from_text(text)
-                if phone:
-                    db.mark_success(phone)
-                    db.add_stat(user_id, phone, 'success')
-                    await event.reply(f"✅ {phone} — ВСТАЛ!")
-                else:
-                    last = db.get_last_pending_number(user_id)
-                    if last:
-                        db.mark_success(last)
-                        db.add_stat(user_id, last, 'success')
-                        await event.reply(f"✅ {last} — ВСТАЛ!")
-        except Exception as e:
-            print(f"[ERROR] handle_target: {e}")
 
 # ========== ВОССТАНОВЛЕНИЕ СЕССИЙ ==========
 async def restore_sessions():
@@ -485,9 +565,7 @@ async def restore_sessions():
             if await client.is_user_authorized():
                 user_clients[user_id] = client
                 print(f"[LOG] Сессия {user_id} восстановлена")
-                source, _ = db.get_groups(user_id)
-                if source:
-                    asyncio.create_task(start_source_listener(user_id, client, source))
+                await setup_user_handlers(user_id, client)
             else:
                 print(f"[LOG] Сессия {user_id} невалидна")
         except Exception as e:
@@ -496,13 +574,13 @@ async def restore_sessions():
 # ========== ЗАПУСК ==========
 async def main():
     global bot
-    print("💎 DIAMOND AUTOVBIV BOT v4.2")
+    print("💎 DIAMOND AUTOVBIV BOT (User-Bot Mode)")
     print(f"📡 API_ID: {API_ID}")
     bot = TelegramClient("diamond_bot", API_ID, API_HASH)
     await bot.start(bot_token=BOT_TOKEN)
     await restore_sessions()
-    await setup_handlers()
-    print("✅ Бот запущен!")
+    await setup_bot_handlers()
+    print("✅ Бот запущен. Команды /set_source и /set_target работают в группах через ваш аккаунт.")
     await bot.run_until_disconnected()
 
 if __name__ == "__main__":
