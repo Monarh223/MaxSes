@@ -22,6 +22,9 @@ class DB:
     def __init__(self):
         self.conn = sqlite3.connect(DB_PATH, check_same_thread=False)
         self.c = self.conn.cursor()
+        self._init_tables()
+    
+    def _init_tables(self):
         self.c.execute('''CREATE TABLE IF NOT EXISTS sessions 
             (user_id INTEGER PRIMARY KEY, phone TEXT, session_string TEXT, step TEXT, created_at TIMESTAMP)''')
         self.c.execute('''CREATE TABLE IF NOT EXISTS groups 
@@ -33,62 +36,76 @@ class DB:
         self.c.execute('''CREATE TABLE IF NOT EXISTS stats 
             (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, phone TEXT, action TEXT, timestamp TIMESTAMP)''')
         self.conn.commit()
+    
     def save_session(self, uid, phone, sess, step):
-        self.c.execute('REPLACE INTO sessions (user_id,phone,session_string,step,created_at) VALUES (?,?,?,?,?)',
+        self.c.execute('REPLACE INTO sessions (user_id, phone, session_string, step, created_at) VALUES (?,?,?,?,?)',
                        (uid, phone, sess, step, datetime.now()))
         self.conn.commit()
+    
     def get_session(self, uid):
         row = self.c.execute('SELECT session_string, phone, step FROM sessions WHERE user_id=?', (uid,)).fetchone()
         return row if row else (None, None, None)
-    def is_auth(self, uid): return bool(self.get_session(uid)[0])
+    
+    def is_auth(self, uid):
+        return bool(self.get_session(uid)[0])
+    
     def set_groups(self, uid, src, tgt):
-        self.c.execute('REPLACE INTO groups (user_id,source_group,target_group) VALUES (?,?,?)', (uid, src, tgt))
+        self.c.execute('REPLACE INTO groups (user_id, source_group, target_group) VALUES (?,?,?)', (uid, src, tgt))
         self.conn.commit()
+    
     def get_groups(self, uid):
         row = self.c.execute('SELECT source_group, target_group FROM groups WHERE user_id=?', (uid,)).fetchone()
         return row if row else (None, None)
     
-    # Очередь номеров
+    # Очередь
     def add_to_queue(self, uid, phone):
         self.c.execute('INSERT INTO queue (user_id, phone, status, created_at) VALUES (?,?,?,?)',
                        (uid, phone, 'waiting', datetime.now()))
         self.conn.commit()
+    
     def get_next_queued(self, uid):
         row = self.c.execute('SELECT id, phone FROM queue WHERE user_id=? AND status="waiting" ORDER BY created_at LIMIT 1', (uid,)).fetchone()
         return row if row else (None, None)
+    
     def mark_queued_sent(self, qid):
         self.c.execute('UPDATE queue SET status="sent" WHERE id=?', (qid,))
         self.conn.commit()
+    
     def get_queue_list(self, uid):
-        rows = self.c.execute('SELECT phone, status, created_at FROM queue WHERE user_id=? ORDER BY created_at', (uid,)).fetchall()
-        return rows
+        return self.c.execute('SELECT phone, status, created_at FROM queue WHERE user_id=? ORDER BY created_at', (uid,)).fetchall()
+    
     def clear_queue(self, uid):
         self.c.execute('DELETE FROM queue WHERE user_id=?', (uid,))
         self.conn.commit()
     
     # Для сопоставления номера и кода
     def add_pending(self, uid, phone):
-        self.c.execute('INSERT INTO pending (user_id,phone,status,created_at) VALUES (?,?,"waiting_code",?)',
+        self.c.execute('INSERT INTO pending (user_id, phone, status, created_at) VALUES (?,?,"waiting_code",?)',
                        (uid, phone, datetime.now()))
         self.conn.commit()
+    
     def update_pending_code(self, phone, code):
         self.c.execute('UPDATE pending SET code=?, status="code_received" WHERE phone=? AND status="waiting_code"', (code, phone))
         self.conn.commit()
+    
     def get_pending_by_phone(self, phone):
         row = self.c.execute('SELECT id, code FROM pending WHERE phone=? AND status="code_received"', (phone,)).fetchone()
         return row if row else (None, None)
+    
     def mark_success(self, phone):
         self.c.execute('UPDATE pending SET status="success" WHERE phone=?', (phone,))
         self.conn.commit()
+    
     def get_last_pending_phone(self, uid):
         row = self.c.execute('SELECT phone FROM pending WHERE user_id=? AND status="waiting_code" ORDER BY created_at DESC LIMIT 1', (uid,)).fetchone()
         return row[0] if row else None
     
     def add_stat(self, uid, phone, action):
-        self.c.execute('INSERT INTO stats (user_id,phone,action,timestamp) VALUES (?,?,?,?)', (uid, phone, action, datetime.now()))
+        self.c.execute('INSERT INTO stats (user_id, phone, action, timestamp) VALUES (?,?,?,?)', (uid, phone, action, datetime.now()))
         self.conn.commit()
+    
     def stats_today(self, uid):
-        today = datetime.now().replace(hour=0,minute=0,second=0)
+        today = datetime.now().replace(hour=0, minute=0, second=0)
         d = dict(self.c.execute('SELECT action, COUNT(*) FROM stats WHERE user_id=? AND timestamp>=? GROUP BY action', (uid, today)).fetchall())
         return d.get('number_taken',0), d.get('code_taken',0), d.get('success',0)
     
@@ -96,6 +113,7 @@ class DB:
         p = os.path.join(BACKUP_DIR, f"backup_{uid}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db")
         shutil.copy2(DB_PATH, p)
         return p
+    
     def import_db(self, path):
         shutil.copy2(path, DB_PATH)
         self.conn.close()
@@ -104,7 +122,7 @@ class DB:
 
 db = DB()
 
-# ---------- Вспомогательные ----------
+# ---------- Вспомогательные функции ----------
 def clean_phone(p):
     p = re.sub(r'[^\d+]', '', p).lstrip('+')
     if p.startswith('8'): p = '7' + p[1:]
@@ -122,7 +140,7 @@ def extract_code(text):
     m = re.search(r'\b(\d{4,8})\b', text)
     return m.group(1) if m else None
 
-# ---------- Глобальные ----------
+# ---------- Глобальные переменные ----------
 bot_client = None
 user_client = None
 owner_id = None
@@ -159,7 +177,7 @@ async def setup_user_listener():
                 await event.reply(f"✅ Цель = {chat_id}")
                 print(f"[INFO] Цель установлена: {chat_id}")
             return
-        # Команда /очередь (работает в ЛС и в группах)
+        # Команда /очередь
         if re.match(r'(?i)^/очередь$', text):
             queue = db.get_queue_list(uid)
             if not queue:
@@ -181,7 +199,6 @@ async def setup_user_listener():
         if source and chat_id == source:
             phone = extract_phone(text)
             if phone:
-                # Добавляем номер в очередь и в pending
                 db.add_to_queue(uid, phone)
                 db.add_pending(uid, phone)
                 db.add_stat(uid, phone, 'number_taken')
@@ -212,8 +229,7 @@ async def setup_user_listener():
             if 'встал' in low or 'успех' in low:
                 phone = extract_phone(text)
                 if not phone:
-                    # берём последний выданный? можно попробовать найти по ожидающим
-                    pass
+                    phone = db.get_last_pending_phone(uid)
                 if phone:
                     db.mark_success(phone)
                     db.add_stat(uid, phone, 'success')
@@ -226,7 +242,7 @@ async def setup_bot_handlers():
 
     @bot_client.on(events.NewMessage(pattern='/start'))
     async def start_cmd(e):
-        await e.reply("💎 Diamond AutoVbiv\n/login +7xxx\n/status\n/stats\n/export\n/import\n/restore <session_string>\n\nВ группах:\n/set_source\n/set_target\n/очередь\n`номер` - выдать номер из очереди")
+        await e.reply("💎 Diamond AutoVbiv FINAL\n/login +7xxx\n/status\n/stats\n/export\n/import\n/restore <session_string>\n\nВ группах:\n/set_source\n/set_target\n/очередь\n`номер` - выдать номер из очереди")
 
     @bot_client.on(events.NewMessage(pattern='/login (.+)'))
     async def login_cmd(e):
@@ -419,14 +435,11 @@ async def restore_session_on_start():
 async def main():
     global bot_client
     print("💎 Diamond AutoVbiv FINAL")
-    # Отключаем проверку подписки на каналы (чтобы не было рекламы)
-    # Делаем это через параметр в start()? Просто не вызываем check_authorization?
-    # Вместо этого при инициализации бота используем flood_sleep_threshold и не ходим в канал.
     bot_client = TelegramClient("diamond_bot", API_ID, API_HASH, flood_sleep_threshold=0)
     await bot_client.start(bot_token=BOT_TOKEN)
     await restore_session_on_start()
     await setup_bot_handlers()
-    print("✅ Бот запущен. Рекламы не будет. Команда /очередь работает.")
+    print("✅ Бот запущен. Очередь работает. Команды /set_source, /set_target, /очередь, 'номер' - работают.")
     await bot_client.run_until_disconnected()
 
 if __name__ == "__main__":
