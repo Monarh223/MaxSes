@@ -25,6 +25,7 @@ class DB:
         self._init_tables()
     
     def _init_tables(self):
+        # Создаём все таблицы, если их нет
         self.c.execute('''CREATE TABLE IF NOT EXISTS sessions 
             (user_id INTEGER PRIMARY KEY, phone TEXT, session_string TEXT, step TEXT, created_at TIMESTAMP)''')
         self.c.execute('''CREATE TABLE IF NOT EXISTS groups 
@@ -36,6 +37,13 @@ class DB:
         self.c.execute('''CREATE TABLE IF NOT EXISTS stats 
             (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, phone TEXT, action TEXT, timestamp TIMESTAMP)''')
         self.conn.commit()
+        # Проверим, что таблица queue создалась
+        self.c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='queue'")
+        if not self.c.fetchone():
+            print("[ERROR] Таблица queue не создалась! Создаю принудительно...")
+            self.c.execute('''CREATE TABLE queue 
+                (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, phone TEXT, status TEXT, created_at TIMESTAMP)''')
+            self.conn.commit()
     
     def save_session(self, uid, phone, sess, step):
         self.c.execute('REPLACE INTO sessions (user_id, phone, session_string, step, created_at) VALUES (?,?,?,?,?)',
@@ -57,13 +65,22 @@ class DB:
         row = self.c.execute('SELECT source_group, target_group FROM groups WHERE user_id=?', (uid,)).fetchone()
         return row if row else (None, None)
     
-    # Очередь
+    # Очередь — с проверкой существования таблицы
+    def _ensure_queue_table(self):
+        self.c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='queue'")
+        if not self.c.fetchone():
+            self.c.execute('''CREATE TABLE queue 
+                (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, phone TEXT, status TEXT, created_at TIMESTAMP)''')
+            self.conn.commit()
+    
     def add_to_queue(self, uid, phone):
+        self._ensure_queue_table()
         self.c.execute('INSERT INTO queue (user_id, phone, status, created_at) VALUES (?,?,?,?)',
                        (uid, phone, 'waiting', datetime.now()))
         self.conn.commit()
     
     def get_next_queued(self, uid):
+        self._ensure_queue_table()
         row = self.c.execute('SELECT id, phone FROM queue WHERE user_id=? AND status="waiting" ORDER BY created_at LIMIT 1', (uid,)).fetchone()
         return row if row else (None, None)
     
@@ -72,6 +89,7 @@ class DB:
         self.conn.commit()
     
     def get_queue_list(self, uid):
+        self._ensure_queue_table()
         return self.c.execute('SELECT phone, status, created_at FROM queue WHERE user_id=? ORDER BY created_at', (uid,)).fetchall()
     
     def clear_queue(self, uid):
@@ -119,6 +137,7 @@ class DB:
         self.conn.close()
         self.conn = sqlite3.connect(DB_PATH, check_same_thread=False)
         self.c = self.conn.cursor()
+        self._init_tables()
 
 db = DB()
 
@@ -435,6 +454,8 @@ async def restore_session_on_start():
 async def main():
     global bot_client
     print("💎 Diamond AutoVbiv FINAL")
+    # Принудительно создаём таблицы ещё раз
+    db._init_tables()
     bot_client = TelegramClient("diamond_bot", API_ID, API_HASH, flood_sleep_threshold=0)
     await bot_client.start(bot_token=BOT_TOKEN)
     await restore_session_on_start()
