@@ -4,6 +4,7 @@ import re
 import io
 import os
 import sqlite3
+import shutil
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -25,7 +26,7 @@ from PIL import Image
 # ============ .ENV ЗАГРУЗКА ============
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_IDS = list(map(int, os.getenv("ADMIN_IDS", "").split(",")))
+ADMIN_IDS = list(map(int, os.getenv("ADMIN_IDS", "0").split(",")))
 
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN не найден в .env")
@@ -38,13 +39,14 @@ logger = logging.getLogger(__name__)
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher(storage=MemoryStorage())
 
-# ============ БАЗА ДАННЫХ ============
+# ============ ПУТИ ============
 DB_PATH = "esim_bot.db"
 BACKUP_DIR = "backups"
 
 if not os.path.exists(BACKUP_DIR):
     os.makedirs(BACKUP_DIR)
 
+# ============ БАЗА ДАННЫХ ============
 def get_db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -54,7 +56,6 @@ def init_db():
     conn = get_db()
     c = conn.cursor()
 
-    # Пользователи (исполнители)
     c.execute('''
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
@@ -70,7 +71,6 @@ def init_db():
         )
     ''')
 
-    # Заявки
     c.execute('''
         CREATE TABLE IF NOT EXISTS orders (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -88,7 +88,6 @@ def init_db():
         )
     ''')
 
-    # Операторы и цены
     c.execute('''
         CREATE TABLE IF NOT EXISTS operators (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -99,7 +98,6 @@ def init_db():
         )
     ''')
 
-    # Каналы
     c.execute('''
         CREATE TABLE IF NOT EXISTS channels (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -108,7 +106,6 @@ def init_db():
         )
     ''')
 
-    # Группы
     c.execute('''
         CREATE TABLE IF NOT EXISTS groups (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -118,7 +115,6 @@ def init_db():
         )
     ''')
 
-    # Настройки кнопок
     c.execute('''
         CREATE TABLE IF NOT EXISTS button_config (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -130,7 +126,6 @@ def init_db():
         )
     ''')
 
-    # Настройки текстов
     c.execute('''
         CREATE TABLE IF NOT EXISTS text_config (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -139,11 +134,19 @@ def init_db():
         )
     ''')
 
-    # Автобэкап
     c.execute('''
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
             value TEXT
+        )
+    ''')
+
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS referrals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            referrer_id INTEGER,
+            referral_id INTEGER UNIQUE,
+            created TEXT DEFAULT CURRENT_TIMESTAMP
         )
     ''')
 
@@ -158,9 +161,9 @@ def init_db():
         ('Добросвязь', 14, '🟣'),
     ]
     for name, price, emoji in defaults:
-        c.execute('INSERT OR IGNORE INTO operators (name, price, emoji) VALUES (?, ?, ?)', (name, price, emoji))
+        c.execute('INSERT OR IGNORE INTO operators (name, price, emoji) VALUES (?, ?, ?)',
+                  (name, price, emoji))
 
-    # Дефолтные настройки
     c.execute('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)', ('auto_backup', 'off'))
     c.execute('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)', ('default_mode', 'БХ'))
 
@@ -187,16 +190,16 @@ class AdminStates(StatesGroup):
     waiting_for_broadcast = State()
     waiting_for_text_key = State()
     waiting_for_text_content = State()
-
-class CreateOrder(StatesGroup):
-    waiting_for_operator = State()
+    waiting_for_edit_operator = State()
+    waiting_for_edit_price = State()
+    waiting_for_delete_operator = State()
+    waiting_for_mode = State()
 
 # ============ ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ============
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
 def format_phone(phone: str) -> Optional[str]:
-    """Приводит номер к формату +7XXXXXXXXXX"""
     digits = re.sub(r'\D', '', phone)
     if len(digits) == 11 and digits[0] in ['7', '8']:
         return f"+7{digits[1:]}"
@@ -258,8 +261,15 @@ def get_operators():
     conn.close()
     return rows
 
+def get_all_operators():
+    conn = get_db()
+    c = conn.cursor()
+    c.execute('SELECT * FROM operators ORDER BY id')
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
 def generate_qr_bytes(lpa_string: str) -> io.BytesIO:
-    """Генерирует QR из LPA строки"""
     qr = qrcode.QRCode(version=1, error_correction=qrcode.constants.ERROR_CORRECT_H,
                        box_size=10, border=4)
     qr.add_data(lpa_string)
@@ -269,6 +279,51 @@ def generate_qr_bytes(lpa_string: str) -> io.BytesIO:
     img.save(bio, 'PNG')
     bio.seek(0)
     return bio
+
+def get_setting(key: str) -> str:
+    conn = get_db()
+    c = conn.cursor()
+    c.execute('SELECT value FROM settings WHERE key = ?', (key,))
+    row = c.fetchone()
+    conn.close()
+    return row['value'] if row else ''
+
+def set_setting(key: str, value: str):
+    conn = get_db()
+    c = conn.cursor()
+    c.execute('INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = ?',
+              (key, value, value))
+    conn.commit()
+    conn.close()
+
+def get_button_configs():
+    conn = get_db()
+    c = conn.cursor()
+    c.execute('SELECT * FROM button_config ORDER BY row, position')
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+async def update_channel_order_msg(order_id: int, text: str, kb=None):
+    conn = get_db()
+    c = conn.cursor()
+    c.execute('SELECT channel_msg_id FROM orders WHERE id = ?', (order_id,))
+    order = c.fetchone()
+    conn.close()
+
+    if order and order['channel_msg_id']:
+        channels = get_active_channels()
+        for ch in channels:
+            try:
+                await bot.edit_message_text(
+                    chat_id=ch['channel_id'],
+                    message_id=order['channel_msg_id'],
+                    text=text,
+                    reply_markup=kb
+                )
+                break
+            except:
+                continue
 
 # ============ КЛАВИАТУРЫ ============
 def main_menu():
@@ -295,6 +350,7 @@ def admin_menu():
         [InlineKeyboardButton(text="👤 Участники", callback_data="admin_users")],
         [InlineKeyboardButton(text="📢 Рассылка", callback_data="admin_broadcast")],
         [InlineKeyboardButton(text="📱 Создать заявку", callback_data="admin_create_order")],
+        [InlineKeyboardButton(text="🎯 Режим сдачи", callback_data="admin_mode")],
         [InlineKeyboardButton(text="💾 БД: Выгрузка", callback_data="admin_db_export")],
         [InlineKeyboardButton(text="💾 БД: Загрузка", callback_data="admin_db_import")],
         [InlineKeyboardButton(text=auto_text, callback_data="admin_db_auto")],
@@ -312,7 +368,7 @@ def operators_keyboard():
                 callback_data=f"order_op_{op['id']}"
             )
         ])
-    kb.inline_keyboard.append([InlineKeyboardButton(text="🔙 Назад", callback_data="back_main")])
+    kb.inline_keyboard.append([InlineKeyboardButton(text="🔙 Назад", callback_data="admin_back")])
     return kb
 
 def back_to_admin():
@@ -320,26 +376,74 @@ def back_to_admin():
         [InlineKeyboardButton(text="🔙 Назад", callback_data="admin_back")]
     ])
 
-def get_setting(key: str) -> str:
-    conn = get_db()
-    c = conn.cursor()
-    c.execute('SELECT value FROM settings WHERE key = ?', (key,))
-    row = c.fetchone()
-    conn.close()
-    return row['value'] if row else ''
-
-def set_setting(key: str, value: str):
-    conn = get_db()
-    c = conn.cursor()
-    c.execute('INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = ?',
-              (key, value, value))
-    conn.commit()
-    conn.close()
+def back_to_main():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="back_main")]
+    ])
 
 # ============ /start ============
 @dp.message(Command("start"))
-async def cmd_start(message: Message):
+async def cmd_start(message: Message, state: FSMContext):
     ensure_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
+
+    args = message.text.split()
+
+    # Проверяем реферальную ссылку
+    if len(args) > 1 and args[1].startswith("ref_"):
+        referrer_id = int(args[1].replace("ref_", ""))
+        if referrer_id != message.from_user.id:
+            conn = get_db()
+            c = conn.cursor()
+            c.execute('INSERT OR IGNORE INTO referrals (referrer_id, referral_id) VALUES (?, ?)',
+                      (referrer_id, message.from_user.id))
+            conn.commit()
+            conn.close()
+
+    # Проверяем deep link на заказ
+    if len(args) > 1 and args[1].startswith("order_"):
+        order_id = int(args[1].replace("order_", ""))
+
+        conn = get_db()
+        c = conn.cursor()
+        c.execute('SELECT * FROM orders WHERE id = ?', (order_id,))
+        order = c.fetchone()
+
+        if not order:
+            await message.answer("❌ Заказ не найден.")
+            conn.close()
+            return
+
+        if order['status'] != 'active':
+            await message.answer("❌ Заказ уже занят другим исполнителем.")
+            conn.close()
+            return
+
+        # Занять заказ
+        c.execute('UPDATE orders SET status = ?, executor_id = ?, taken = ? WHERE id = ?',
+                  ('taken', message.from_user.id, datetime.now().isoformat(), order_id))
+        conn.commit()
+        conn.close()
+
+        # Обновить сообщение в канале
+        await update_channel_order_msg(
+            order_id,
+            f"<b>🔒 ЗАКАЗ #{order_id} ЗАНЯТ</b>\n\n"
+            f"📱 <b>Оператор:</b> {order['operator']}\n"
+            f"💰 <b>Цена:</b> {order['price']}$\n"
+            f"👤 <b>Исполнитель:</b> @{message.from_user.username or message.from_user.id}\n"
+            f"⏳ <b>Ожидание сдачи...</b>"
+        )
+
+        await message.answer(
+            f"<b>✅ ЗАКАЗ #{order_id} ПРИНЯТ!</b>\n\n"
+            f"📱 {order['operator']} · {order['price']}$\n\n"
+            f"<b>Отправьте фото QR-кода и укажите номер телефона.</b>"
+        )
+        await state.set_state(EsimUpload.waiting_for_qr)
+        await state.update_data(order_id=order_id)
+        return
+
+    # Обычный /start
     await message.answer(
         "<b>🚀 ERWINS ESIM BOT</b>\n\nВыберите действие:",
         reply_markup=main_menu()
@@ -357,8 +461,7 @@ async def cmd_emjid(message: Message):
     await message.answer(
         f"<b>Эмодзи:</b> {emoji}\n"
         f"<b>Unicode:</b> <code>U+{code[2:].upper()}</code>\n"
-        f"<b>HTML:</b> <code>&amp;#x{code[2:]};</code>\n"
-        f"<b>Для кнопок:</b> можно вставить в админ-панели"
+        f"<b>HTML:</b> <code>&amp;#x{code[2:]};</code>"
     )
 
 # ============ /admin ============
@@ -428,6 +531,45 @@ async def cmd_esim(message: Message):
 
     await message.answer("<b>📱 ВЫБЕРИТЕ ОПЕРАТОРА</b>", reply_markup=kb)
 
+# ============ /orders (активные заявки) ============
+@dp.message(Command("orders"))
+async def cmd_orders(message: Message):
+    conn = get_db()
+    c = conn.cursor()
+    c.execute('SELECT * FROM orders WHERE status = "active" ORDER BY created DESC LIMIT 10')
+    orders = c.fetchall()
+    conn.close()
+
+    if not orders:
+        await message.answer("📭 Нет активных заявок.")
+        return
+
+    text = "<b>📋 АКТИВНЫЕ ЗАЯВКИ</b>\n\n"
+    for o in orders:
+        text += f"#{o['id']} · {o['operator']} · {o['price']}$ · {o['mode']}\n"
+
+    await message.answer(text)
+
+# ============ /rating ============
+@dp.message(Command("rating"))
+async def cmd_rating(message: Message):
+    conn = get_db()
+    c = conn.cursor()
+    c.execute('SELECT username, first_name, total_qr, qr_month, rank FROM users ORDER BY total_qr DESC LIMIT 20')
+    users = c.fetchall()
+    conn.close()
+
+    if not users:
+        await message.answer("Пока нет данных.")
+        return
+
+    text = "<b>🏆 РЕЙТИНГ ИСПОЛНИТЕЛЕЙ</b>\n\n"
+    for i, u in enumerate(users, 1):
+        name = u['username'] or u['first_name'] or u'—'
+        text += f"{i}. {name} · {u['total_qr']} QR · {u['rank']}\n"
+
+    await message.answer(text)
+
 # ============ ЗАПРОС ИЗ ГРУППЫ ============
 @dp.callback_query(F.data.startswith("group_req_"))
 async def group_request(callback: CallbackQuery):
@@ -456,10 +598,12 @@ async def group_request(callback: CallbackQuery):
     conn.commit()
     conn.close()
 
-    # Публикуем в канал
-    channel_id = channels[0]['channel_id']
+    # Формируем ссылку на бота
+    bot_username = (await bot.me()).username
+    deep_link = f"https://t.me/{bot_username}?start=order_{order_id}"
+
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔥 ЗАБРАТЬ ЗАКАЗ", callback_data=f"take_order_{order_id}")]
+        [InlineKeyboardButton(text="🔥 ЗАБРАТЬ ЗАКАЗ", url=deep_link)]
     ])
 
     msg_text = (
@@ -468,73 +612,24 @@ async def group_request(callback: CallbackQuery):
         f"💰 <b>Цена:</b> {op['price']}$\n"
         f"🎯 <b>Режим:</b> {get_setting('default_mode')}\n"
         f"⏳ <b>Дедлайн:</b> 10 минут\n\n"
-        f"<i>Кто первый нажмёт — тому заказ</i>"
+        f"<i>Нажмите кнопку чтобы забрать заказ</i>"
     )
 
     try:
+        channel_id = channels[0]['channel_id']
         sent = await bot.send_message(chat_id=channel_id, text=msg_text, reply_markup=kb)
-        c = get_db().cursor()
         conn = get_db()
-        c.execute('UPDATE orders SET channel_msg_id = ? WHERE id = ?', (sent.message_id, order_id))
+        c = conn.cursor()
+        c.execute('UPDATE orders SET channel_msg_id = ? WHERE id = ?',
+                  (sent.message_id, order_id))
         conn.commit()
         conn.close()
-        await callback.answer("✅ Заявка создана и отправлена в канал!")
+        await callback.answer("✅ Заявка создана!")
         await callback.message.edit_text(
             callback.message.text + f"\n\n✅ Заявка #{order_id} отправлена в канал."
         )
     except Exception as e:
         await callback.answer(f"Ошибка: {e}")
-
-# ============ ЗАБРАТЬ ЗАКАЗ ============
-@dp.callback_query(F.data.startswith("take_order_"))
-async def take_order(callback: CallbackQuery):
-    order_id = int(callback.data.split("_")[2])
-    conn = get_db()
-    c = conn.cursor()
-    c.execute('SELECT * FROM orders WHERE id = ?', (order_id,))
-    order = c.fetchone()
-
-    if not order:
-        await callback.answer("Заказ не найден")
-        conn.close()
-        return
-
-    if order['status'] != 'active':
-        await callback.answer("❌ Заказ уже занят!")
-        conn.close()
-        return
-
-    # Занять заказ
-    c.execute('UPDATE orders SET status = ?, executor_id = ?, taken = ? WHERE id = ?',
-              ('taken', callback.from_user.id, datetime.now().isoformat(), order_id))
-    conn.commit()
-
-    # Обновить сообщение в канале
-    try:
-        new_text = (
-            f"<b>🔒 ЗАКАЗ #{order_id} ЗАНЯТ</b>\n\n"
-            f"📱 <b>Оператор:</b> {order['operator']}\n"
-            f"💰 <b>Цена:</b> {order['price']}$\n"
-            f"👤 <b>Исполнитель:</b> @{callback.from_user.username or callback.from_user.id}\n"
-            f"⏳ <b>Ожидание сдачи...</b>"
-        )
-        await callback.message.edit_text(new_text, reply_markup=None)
-    except:
-        pass
-
-    conn.close()
-
-    # Уведомить исполнителя
-    await callback.answer("✅ Заказ ваш! Сдайте ESIM в ЛС бота.")
-    await bot.send_message(
-        callback.from_user.id,
-        f"<b>✅ ЗАКАЗ #{order_id} ПРИНЯТ!</b>\n\n"
-        f"📱 {order['operator']} · {order['price']}$\n\n"
-        f"<b>Отправьте фото QR-кода и укажите номер.</b>",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📱 Сдать ESIM", callback_data=f"sdat_for_{order_id}")]
-        ])
-    )
 
 # ============ СДАТЬ ESIM (ЛИЧКА) ============
 @dp.callback_query(F.data == "sdat_esim")
@@ -581,7 +676,12 @@ async def esim_phone_received(message: Message, state: FSMContext):
     order_id = data.get('order_id')
     await save_esim(message, state, file_id, phone, order_id)
 
-async def save_esim(message: Message, state: FSMContext, file_id: str, phone: str, order_id: int = None):
+@dp.message(EsimUpload.waiting_for_qr, F.text)
+async def esim_text_instead_qr(message: Message):
+    await message.answer("❌ Отправьте фото QR-кода, а не текст.")
+
+async def save_esim(message: Message, state: FSMContext, file_id: str, phone: str,
+                    order_id: int = None):
     user_id = message.from_user.id
     ensure_user(user_id, message.from_user.username, message.from_user.first_name)
 
@@ -589,51 +689,85 @@ async def save_esim(message: Message, state: FSMContext, file_id: str, phone: st
     c = conn.cursor()
 
     if order_id:
+        # Обновляем заказ
         c.execute('UPDATE orders SET status = ?, phone = ?, qr_file_id = ?, done = ? WHERE id = ?',
                   ('done', phone, file_id, datetime.now().isoformat(), order_id))
+        c.execute('SELECT * FROM orders WHERE id = ?', (order_id,))
+        order = c.fetchone()
+
         # Обновить счётчик
         c.execute('UPDATE users SET qr_month = qr_month + 1, total_qr = total_qr + 1 WHERE user_id = ?',
                   (user_id,))
 
-    conn.commit()
-    c.execute('SELECT * FROM users WHERE user_id = ?', (user_id,))
-    user = c.fetchone()
-    conn.close()
+        conn.commit()
+        c.execute('SELECT * FROM users WHERE user_id = ?', (user_id,))
+        user = c.fetchone()
+        conn.close()
 
-    bonus = user['bonus'] if user else 0
-    qr_month = user['qr_month'] if user else 0
+        bonus = user['bonus'] if user else 0
+        qr_month = user['qr_month'] if user else 0
 
-    await message.answer(
-        f"<b>✅ ESIM СДАН!</b>\n\n"
-        f"📱 <b>Номер:</b> <code>{phone}</code>\n"
-        f"📊 <b>Зачтено QR за месяц:</b> {qr_month}\n"
-        f"💵 <b>Бонус:</b> +{bonus}$ к каждому QR\n"
-        f"🏆 <b>Ранг:</b> {user['rank'] if user else 'Старт'}"
-    )
+        # Обновить сообщение в канале
+        if order:
+            await update_channel_order_msg(
+                order_id,
+                f"<b>✅ ЗАКАЗ #{order_id} ВЫПОЛНЕН</b>\n\n"
+                f"📱 {order['operator']} · <code>{phone}</code>\n"
+                f"👤 @{message.from_user.username or user_id}"
+            )
+
+        await message.answer(
+            f"<b>✅ ESIM СДАН!</b>\n\n"
+            f"📱 <b>Номер:</b> <code>{phone}</code>\n"
+            f"📊 <b>Зачтено QR за месяц:</b> {qr_month}\n"
+            f"💵 <b>Бонус:</b> +{bonus}$ к каждому QR\n"
+            f"🏆 <b>Ранг:</b> {user['rank'] if user else 'Старт'}"
+        )
+    else:
+        # Просто сохраняем в базу без привязки к заказу
+        c.execute('INSERT INTO orders (operator, price, mode, status, executor_id, phone, qr_file_id, done) '
+                  'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+                  ('Неизвестно', 0, get_setting('default_mode'), 'done', user_id, phone, file_id,
+                   datetime.now().isoformat()))
+        c.execute('UPDATE users SET qr_month = qr_month + 1, total_qr = total_qr + 1 WHERE user_id = ?',
+                  (user_id,))
+        conn.commit()
+        c.execute('SELECT * FROM users WHERE user_id = ?', (user_id,))
+        user = c.fetchone()
+        conn.close()
+
+        bonus = user['bonus'] if user else 0
+        qr_month = user['qr_month'] if user else 0
+
+        await message.answer(
+            f"<b>✅ ESIM СДАН!</b>\n\n"
+            f"📱 <b>Номер:</b> <code>{phone}</code>\n"
+            f"📊 <b>Зачтено QR за месяц:</b> {qr_month}\n"
+            f"💵 <b>Бонус:</b> +{bonus}$ к каждому QR\n"
+            f"🏆 <b>Ранг:</b> {user['rank'] if user else 'Старт'}\n\n"
+            f"⚠️ Заявка не была привязана к заказу."
+        )
 
     await state.clear()
 
 # ============ АДМИН: КАНАЛЫ ============
 @dp.callback_query(F.data == "admin_channels")
 async def admin_channels(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Доступ запрещён")
-        return
-
+    if not is_admin(callback.from_user.id): return
     channels = get_active_channels()
     text = "<b>📢 НАСТРОЙКА КАНАЛОВ</b>\n\n"
     if channels:
         for ch in channels:
             text += f"• {ch['username'] or ch['channel_id']}\n"
     else:
-        text += "<i>Нет каналов</i>"
+        text += "<i>Нет каналов</i>\n\n"
+        text += "<b>Как добавить:</b>\n1. Добавьте бота в канал администратором\n2. Перешлите сообщение из канала сюда"
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="➕ Добавить канал", callback_data="admin_add_channel")],
         [InlineKeyboardButton(text="🗑️ Удалить канал", callback_data="admin_del_channel")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="admin_back")],
     ])
-
     await callback.message.edit_text(text, reply_markup=kb)
     await callback.answer()
 
@@ -650,7 +784,6 @@ async def admin_add_channel(callback: CallbackQuery, state: FSMContext):
 @dp.message(AdminStates.waiting_for_channel)
 async def channel_received(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id): return
-
     channel_id = None
     username = None
 
@@ -663,7 +796,7 @@ async def channel_received(message: Message, state: FSMContext):
             chat = await bot.get_chat(username)
             channel_id = str(chat.id)
         except:
-            await message.answer("Не удалось найти канал")
+            await message.answer("❌ Не удалось найти канал. Проверьте что бот добавлен в него.")
             return
     else:
         await message.answer("Перешлите сообщение из канала или введите @username")
@@ -679,6 +812,18 @@ async def channel_received(message: Message, state: FSMContext):
     await message.answer(f"✅ Канал {username or channel_id} добавлен!")
     await state.clear()
 
+@dp.callback_query(F.data == "admin_del_channel")
+async def admin_del_channel(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id): return
+    conn = get_db()
+    c = conn.cursor()
+    c.execute('DELETE FROM channels')
+    conn.commit()
+    conn.close()
+    await callback.answer("Все каналы удалены.")
+    await callback.message.edit_text("<b>📢 НАСТРОЙКА КАНАЛОВ</b>\n\n<i>Все каналы удалены.</i>",
+                                     reply_markup=back_to_admin())
+
 # ============ АДМИН: ГРУППЫ ============
 @dp.callback_query(F.data == "admin_groups")
 async def admin_groups(callback: CallbackQuery):
@@ -690,12 +835,16 @@ async def admin_groups(callback: CallbackQuery):
     conn.close()
 
     text = "<b>👥 НАСТРОЙКА ГРУПП</b>\n\n"
-    for g in groups:
-        status = "🟢 Активна" if g['active'] else "🔴 Неактивна"
-        text += f"• {g['username'] or g['group_id']} — {status}\n"
+    if groups:
+        for g in groups:
+            status = "🟢 Активна" if g['active'] else "🔴 Неактивна"
+            text += f"• {g['username'] or g['group_id']} — {status}\n"
+    else:
+        text += "<i>Нет групп</i>"
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="➕ Добавить группу", callback_data="admin_add_group")],
+        [InlineKeyboardButton(text="🗑️ Удалить все", callback_data="admin_del_groups")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="admin_back")],
     ])
     await callback.message.edit_text(text, reply_markup=kb)
@@ -704,7 +853,10 @@ async def admin_groups(callback: CallbackQuery):
 @dp.callback_query(F.data == "admin_add_group")
 async def admin_add_group(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id): return
-    await callback.message.edit_text("Добавьте бота в группу и введите её @username или ID.")
+    await callback.message.edit_text(
+        "Добавьте бота в группу и введите её @username или перешлите сообщение из группы.",
+        reply_markup=back_to_admin()
+    )
     await state.set_state(AdminStates.waiting_for_group)
     await callback.answer()
 
@@ -713,37 +865,59 @@ async def group_received(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id): return
     group_id = None
     username = None
-    if message.text:
+
+    if message.forward_from_chat:
+        group_id = str(message.forward_from_chat.id)
+        username = message.forward_from_chat.username
+    elif message.text:
         username = message.text.strip()
         try:
             chat = await bot.get_chat(username)
             group_id = str(chat.id)
         except:
-            await message.answer("Не удалось найти группу")
+            await message.answer("❌ Не удалось найти группу.")
             return
+    else:
+        await message.answer("Введите @username группы или перешлите сообщение.")
+        return
 
     conn = get_db()
     c = conn.cursor()
-    c.execute('INSERT OR IGNORE INTO groups (group_id, username) VALUES (?, ?)', (group_id, username))
+    c.execute('INSERT OR IGNORE INTO groups (group_id, username) VALUES (?, ?)',
+              (group_id, username))
     conn.commit()
     conn.close()
 
     await message.answer(f"✅ Группа добавлена! В группе напишите /work для активации.")
     await state.clear()
 
+@dp.callback_query(F.data == "admin_del_groups")
+async def admin_del_groups(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id): return
+    conn = get_db()
+    c = conn.cursor()
+    c.execute('DELETE FROM groups')
+    conn.commit()
+    conn.close()
+    await callback.answer("Все группы удалены.")
+    await callback.message.edit_text("<b>👥 НАСТРОЙКА ГРУПП</b>\n\n<i>Все группы удалены.</i>",
+                                     reply_markup=back_to_admin())
+
 # ============ АДМИН: ОПЕРАТОРЫ ============
 @dp.callback_query(F.data == "admin_operators")
 async def admin_operators(callback: CallbackQuery):
     if not is_admin(callback.from_user.id): return
-    ops = get_operators()
+    ops = get_all_operators()
     text = "<b>💰 ОПЕРАТОРЫ И ЦЕНЫ</b>\n\n"
     for op in ops:
-        text += f"{op['emoji']} {op['name']} — {op['price']}$\n"
+        status = "🟢" if op['active'] else "🔴"
+        text += f"{status} {op['emoji']} {op['name']} — {op['price']}$\n"
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Добавить оператора", callback_data="admin_add_op")],
+        [InlineKeyboardButton(text="➕ Добавить", callback_data="admin_add_op")],
         [InlineKeyboardButton(text="✏️ Изменить цену", callback_data="admin_edit_op")],
-        [InlineKeyboardButton(text="🗑️ Удалить оператора", callback_data="admin_del_op")],
+        [InlineKeyboardButton(text="🔄 Вкл/Выкл", callback_data="admin_toggle_op")],
+        [InlineKeyboardButton(text="🗑️ Удалить", callback_data="admin_del_op")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="admin_back")],
     ])
     await callback.message.edit_text(text, reply_markup=kb)
@@ -767,7 +941,7 @@ async def op_price_received(message: Message, state: FSMContext):
     try:
         price = float(message.text)
     except:
-        await message.answer("Введите число!")
+        await message.answer("❌ Введите число!")
         return
     await state.update_data(op_price=price)
     await message.answer("Отправьте эмодзи для оператора:")
@@ -785,6 +959,133 @@ async def op_emoji_received(message: Message, state: FSMContext):
     conn.close()
     await message.answer(f"✅ Оператор {emoji} {data['op_name']} · {data['op_price']}$ добавлен!")
     await state.clear()
+
+@dp.callback_query(F.data == "admin_edit_op")
+async def admin_edit_op(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id): return
+    ops = get_all_operators()
+    kb = InlineKeyboardMarkup(inline_keyboard=[])
+    for op in ops:
+        kb.inline_keyboard.append([
+            InlineKeyboardButton(
+                text=f"{op['emoji']} {op['name']} · {op['price']}$",
+                callback_data=f"editop_{op['id']}"
+            )
+        ])
+    kb.inline_keyboard.append([InlineKeyboardButton(text="🔙 Назад", callback_data="admin_back")])
+    await callback.message.edit_text("<b>Выберите оператора для изменения цены:</b>", reply_markup=kb)
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("editop_"))
+async def edit_op_price(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id): return
+    op_id = int(callback.data.split("_")[1])
+    await state.update_data(edit_op_id=op_id)
+    await callback.message.edit_text("Введите новую цену ($):", reply_markup=back_to_admin())
+    await state.set_state(AdminStates.waiting_for_edit_price)
+    await callback.answer()
+
+@dp.message(AdminStates.waiting_for_edit_price)
+async def edit_price_received(message: Message, state: FSMContext):
+    try:
+        price = float(message.text)
+    except:
+        await message.answer("❌ Введите число!")
+        return
+    data = await state.get_data()
+    op_id = data['edit_op_id']
+    conn = get_db()
+    c = conn.cursor()
+    c.execute('UPDATE operators SET price = ? WHERE id = ?', (price, op_id))
+    conn.commit()
+    conn.close()
+    await message.answer(f"✅ Цена обновлена: {price}$")
+    await state.clear()
+
+@dp.callback_query(F.data == "admin_toggle_op")
+async def admin_toggle_op(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id): return
+    ops = get_all_operators()
+    kb = InlineKeyboardMarkup(inline_keyboard=[])
+    for op in ops:
+        status = "🟢" if op['active'] else "🔴"
+        kb.inline_keyboard.append([
+            InlineKeyboardButton(
+                text=f"{status} {op['emoji']} {op['name']}",
+                callback_data=f"toggleop_{op['id']}"
+            )
+        ])
+    kb.inline_keyboard.append([InlineKeyboardButton(text="🔙 Назад", callback_data="admin_back")])
+    await callback.message.edit_text("<b>Вкл/Выкл оператора:</b>", reply_markup=kb)
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("toggleop_"))
+async def toggle_operator(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id): return
+    op_id = int(callback.data.split("_")[1])
+    conn = get_db()
+    c = conn.cursor()
+    c.execute('SELECT active FROM operators WHERE id = ?', (op_id,))
+    row = c.fetchone()
+    new_status = 0 if row['active'] == 1 else 1
+    c.execute('UPDATE operators SET active = ? WHERE id = ?', (new_status, op_id))
+    conn.commit()
+    conn.close()
+    await callback.answer(f"Статус изменён на {'🟢 Вкл' if new_status else '🔴 Выкл'}")
+    await admin_toggle_op(callback)
+
+@dp.callback_query(F.data == "admin_del_op")
+async def admin_del_op(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id): return
+    ops = get_all_operators()
+    kb = InlineKeyboardMarkup(inline_keyboard=[])
+    for op in ops:
+        kb.inline_keyboard.append([
+            InlineKeyboardButton(
+                text=f"🗑️ {op['emoji']} {op['name']}",
+                callback_data=f"delop_{op['id']}"
+            )
+        ])
+    kb.inline_keyboard.append([InlineKeyboardButton(text="🔙 Назад", callback_data="admin_back")])
+    await callback.message.edit_text("<b>Выберите оператора для удаления:</b>", reply_markup=kb)
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("delop_"))
+async def delete_operator(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id): return
+    op_id = int(callback.data.split("_")[1])
+    conn = get_db()
+    c = conn.cursor()
+    c.execute('DELETE FROM operators WHERE id = ?', (op_id,))
+    conn.commit()
+    conn.close()
+    await callback.answer("Оператор удалён.")
+    await admin_del_op(callback)
+
+# ============ АДМИН: РЕЖИМ СДАЧИ ============
+@dp.callback_query(F.data == "admin_mode")
+async def admin_mode(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id): return
+    current = get_setting('default_mode')
+    text = f"<b>🎯 РЕЖИМ СДАЧИ</b>\n\nТекущий режим: <b>{current}</b>\n\n"
+    if current == 'БХ':
+        text += "• <b>БХ</b> — без холда, оплачивается даже 5 минут\n• ХД — с холдом"
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🟢 БХ (без холда)", callback_data="set_mode_БХ")],
+        [InlineKeyboardButton(text="🟡 ХД (с холдом)", callback_data="set_mode_ХД")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="admin_back")],
+    ])
+    await callback.message.edit_text(text, reply_markup=kb)
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("set_mode_"))
+async def set_mode(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id): return
+    mode = callback.data.split("_")[2]
+    set_setting('default_mode', mode)
+    await callback.answer(f"Режим изменён на {mode}")
+    await admin_mode(callback)
 
 # ============ АДМИН: БД ============
 @dp.callback_query(F.data == "admin_db_export")
@@ -830,7 +1131,7 @@ async def admin_db_auto(callback: CallbackQuery):
     await callback.answer(f"Автовыгрузка: {new.upper()}")
     await callback.message.edit_reply_markup(reply_markup=admin_menu())
 
-# ============ АДМИН: СОЗДАТЬ ЗАЯВКУ ВРУЧНУЮ ============
+# ============ АДМИН: СОЗДАТЬ ЗАЯВКУ ============
 @dp.callback_query(F.data == "admin_create_order")
 async def admin_create_order(callback: CallbackQuery):
     if not is_admin(callback.from_user.id): return
@@ -858,9 +1159,11 @@ async def admin_order_created(callback: CallbackQuery):
     conn.commit()
     conn.close()
 
-    channel_id = channels[0]['channel_id']
+    bot_username = (await bot.me()).username
+    deep_link = f"https://t.me/{bot_username}?start=order_{order_id}"
+
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔥 ЗАБРАТЬ ЗАКАЗ", callback_data=f"take_order_{order_id}")]
+        [InlineKeyboardButton(text="🔥 ЗАБРАТЬ ЗАКАЗ", url=deep_link)]
     ])
 
     msg_text = (
@@ -869,14 +1172,16 @@ async def admin_order_created(callback: CallbackQuery):
         f"💰 <b>Цена:</b> {op['price']}$\n"
         f"🎯 <b>Режим:</b> {get_setting('default_mode')}\n"
         f"⏳ <b>Дедлайн:</b> 10 минут\n\n"
-        f"<i>Кто первый нажмёт — тому заказ</i>"
+        f"<i>Нажмите кнопку чтобы забрать заказ</i>"
     )
 
     try:
+        channel_id = channels[0]['channel_id']
         sent = await bot.send_message(chat_id=channel_id, text=msg_text, reply_markup=kb)
         conn = get_db()
         c = conn.cursor()
-        c.execute('UPDATE orders SET channel_msg_id = ? WHERE id = ?', (sent.message_id, order_id))
+        c.execute('UPDATE orders SET channel_msg_id = ? WHERE id = ?',
+                  (sent.message_id, order_id))
         conn.commit()
         conn.close()
         await callback.answer("✅ Заявка создана!")
@@ -884,89 +1189,7 @@ async def admin_order_created(callback: CallbackQuery):
     except Exception as e:
         await callback.answer(f"Ошибка: {e}")
 
-# ============ ОБРАБОТЧИКИ НАВИГАЦИИ ============
-@dp.callback_query(F.data == "back_main")
-async def back_main(callback: CallbackQuery):
-    if callback.message.chat.type == ChatType.PRIVATE:
-        await callback.message.edit_text(
-            "<b>🚀 ERWINS ESIM BOT</b>\n\nВыберите действие:",
-            reply_markup=main_menu()
-        )
-    await callback.answer()
-
-@dp.callback_query(F.data == "admin_back")
-async def admin_back(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id): return
-    await callback.message.edit_text("<b>🛠️ АДМИН-ПАНЕЛЬ</b>", reply_markup=admin_menu())
-    await callback.answer()
-
-@dp.callback_query(F.data == "close")
-async def close(callback: CallbackQuery):
-    try:
-        await callback.message.delete()
-    except:
-        pass
-    await callback.answer()
-
-@dp.callback_query(F.data == "profile")
-async def profile(callback: CallbackQuery):
-    user = get_user(callback.from_user.id)
-    if not user:
-        ensure_user(callback.from_user.id, callback.from_user.username, callback.from_user.first_name)
-        user = get_user(callback.from_user.id)
-
-    text = (
-        f"<b>👤 ПРОФИЛЬ</b>\n\n"
-        f"🆔 @{user['username'] or user['user_id']}\n"
-        f"📊 <b>Ранг:</b> {user['rank']}\n"
-        f"💎 <b>Бонус:</b> +{user['bonus']}$ к каждому QR\n"
-        f"📱 <b>Зачтено QR за месяц:</b> {user['qr_month']}\n"
-        f"📈 <b>Всего QR:</b> {user['total_qr']}\n"
-        f"💵 <b>Баланс:</b> {user['balance']}$"
-    )
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔙 Назад", callback_data="back_main")]
-    ])
-    await callback.message.edit_text(text, reply_markup=kb)
-    await callback.answer()
-
-@dp.callback_query(F.data == "operators_list")
-async def operators_list(callback: CallbackQuery):
-    ops = get_operators()
-    text = "<b>📊 ОПЕРАТОРЫ И ЦЕНЫ</b>\n\n"
-    for op in ops:
-        text += f"{op['emoji']} <b>{op['name']}</b> · {op['price']}$\n"
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔙 Назад", callback_data="back_main")]
-    ])
-    await callback.message.edit_text(text, reply_markup=kb)
-    await callback.answer()
-
-@dp.callback_query(F.data == "my_numbers")
-async def my_numbers(callback: CallbackQuery):
-    conn = get_db()
-    c = conn.cursor()
-    c.execute('SELECT * FROM orders WHERE executor_id = ? ORDER BY created DESC LIMIT 20',
-              (callback.from_user.id,))
-    orders = c.fetchall()
-    conn.close()
-
-    if not orders:
-        text = "<b>📋 МОИ НОМЕРА</b>\n\n<i>Нет сданных номеров</i>"
-    else:
-        text = "<b>📋 МОИ НОМЕРА</b>\n\n"
-        for o in orders:
-            status_map = {'active': '🟡', 'taken': '🔵', 'done': '🟢'}
-            s = status_map.get(o['status'], '⚪')
-            phone = o['phone'] or '—'
-            text += f"{s} #{o['id']} {o['operator']} · {phone}\n"
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔙 Назад", callback_data="back_main")]
-    ])
-    await callback.message.edit_text(text, reply_markup=kb)
-    await callback.answer()
-
+# ============ АДМИН: СТАТИСТИКА ============
 @dp.callback_query(F.data == "admin_stats")
 async def admin_stats(callback: CallbackQuery):
     if not is_admin(callback.from_user.id): return
@@ -978,6 +1201,10 @@ async def admin_stats(callback: CallbackQuery):
     orders_count = c.fetchone()[0]
     c.execute('SELECT COUNT(*) FROM orders WHERE status = "done"')
     done_count = c.fetchone()[0]
+    c.execute('SELECT COUNT(*) FROM orders WHERE status = "active"')
+    active_count = c.fetchone()[0]
+    c.execute('SELECT COUNT(*) FROM orders WHERE status = "taken"')
+    taken_count = c.fetchone()[0]
     c.execute('SELECT SUM(price) FROM orders WHERE status = "done"')
     total_sum = c.fetchone()[0] or 0
     conn.close()
@@ -986,51 +1213,131 @@ async def admin_stats(callback: CallbackQuery):
         f"<b>📊 СТАТИСТИКА</b>\n\n"
         f"👥 <b>Исполнителей:</b> {users_count}\n"
         f"📱 <b>Заявок всего:</b> {orders_count}\n"
+        f"🟢 <b>Активных:</b> {active_count}\n"
+        f"🔵 <b>В работе:</b> {taken_count}\n"
         f"✅ <b>Выполнено:</b> {done_count}\n"
         f"💵 <b>Общая сумма:</b> {total_sum}$"
     )
     await callback.message.edit_text(text, reply_markup=back_to_admin())
     await callback.answer()
 
-# ============ ДОПОЛНИТЕЛЬНЫЕ ХЕНДЛЕРЫ ============
-@dp.callback_query(F.data == "referral")
-async def referral(callback: CallbackQuery):
-    ensure_user(callback.from_user.id, callback.from_user.username, callback.from_user.first_name)
-    link = f"https://t.me/{(await bot.me()).username}?start={callback.from_user.id}"
-    user = get_user(callback.from_user.id)
-    text = (
-        f"<b>👥 РЕФЕРАЛЬНАЯ СИСТЕМА</b>\n\n"
-        f"Ваша ссылка:\n<code>{link}</code>\n\n"
-        f"📊 <b>Ранг:</b> {user['rank']}\n"
-        f"💎 <b>Бонус:</b> +{user['bonus']}$ к каждому QR\n"
-        f"📱 <b>QR за месяц:</b> {user['qr_month']}"
-    )
+# ============ АДМИН: УЧАСТНИКИ ============
+@dp.callback_query(F.data == "admin_users")
+async def admin_users(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id): return
+    conn = get_db()
+    c = conn.cursor()
+    c.execute('SELECT * FROM users ORDER BY total_qr DESC LIMIT 50')
+    users = c.fetchall()
+    conn.close()
+
+    text = "<b>👤 УЧАСТНИКИ</b>\n\n"
+    for u in users:
+        name = u['username'] or u['first_name'] or str(u['user_id'])
+        text += f"• @{name} | {u['rank']} | {u['total_qr']} QR | {u['qr_month']} мес\n"
+
+    await callback.message.edit_text(text, reply_markup=back_to_admin())
+    await callback.answer()
+
+# ============ АДМИН: КНОПКИ ============
+@dp.callback_query(F.data == "admin_buttons")
+async def admin_buttons(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id): return
+    buttons = get_button_configs()
+    text = "<b>📝 НАСТРОЙКА КНОПОК</b>\n\n"
+    if buttons:
+        for b in buttons:
+            text += f"• {b['emoji']} {b['text']} — <code>{b['button_name']}</code>\n"
+    else:
+        text += "<i>Нет кастомных кнопок. Кнопки по умолчанию активны.</i>"
+
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔙 Назад", callback_data="back_main")]
+        [InlineKeyboardButton(text="➕ Добавить кнопку", callback_data="admin_add_button")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="admin_back")],
     ])
     await callback.message.edit_text(text, reply_markup=kb)
     await callback.answer()
 
-@dp.callback_query(F.data == "help")
-async def help_cmd(callback: CallbackQuery):
-    text = (
-        "<b>ℹ️ ПОМОЩЬ</b>\n\n"
-        "<b>Как сдать ESIM:</b>\n"
-        "1. Нажмите «Сдать ESIM»\n"
-        "2. Отправьте фото QR-кода\n"
-        "3. Укажите номер телефона\n\n"
-        "<b>Как взять заказ:</b>\n"
-        "• В группе: /esim → выбрать оператора\n"
-        "• В канале: нажать «Забрать заказ»\n\n"
-        "<b>Команды группы:</b>\n"
-        "/work — вкл/выкл бота\n"
-        "/esim — запросить номер"
-    )
+@dp.callback_query(F.data == "admin_add_button")
+async def admin_add_button(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id): return
+    await callback.message.edit_text("Введите название кнопки (латиница, без пробелов):")
+    await state.set_state(AdminStates.waiting_for_button_name)
+    await callback.answer()
+
+@dp.message(AdminStates.waiting_for_button_name)
+async def button_name_received(message: Message, state: FSMContext):
+    await state.update_data(btn_name=message.text.strip())
+    await message.answer("Введите текст кнопки:")
+    await state.set_state(AdminStates.waiting_for_button_text)
+
+@dp.message(AdminStates.waiting_for_button_text)
+async def button_text_received(message: Message, state: FSMContext):
+    await state.update_data(btn_text=message.text.strip())
+    await message.answer("Отправьте эмодзи для кнопки:")
+    await state.set_state(AdminStates.waiting_for_button_emoji)
+
+@dp.message(AdminStates.waiting_for_button_emoji)
+async def button_emoji_received(message: Message, state: FSMContext):
+    data = await state.get_data()
+    emoji = message.text.strip()[0] if message.text else ''
+    conn = get_db()
+    c = conn.cursor()
+    c.execute('INSERT OR REPLACE INTO button_config (button_name, text, emoji) VALUES (?, ?, ?)',
+              (data['btn_name'], data['btn_text'], emoji))
+    conn.commit()
+    conn.close()
+    await message.answer(f"✅ Кнопка {emoji} {data['btn_text']} добавлена!")
+    await state.clear()
+
+# ============ АДМИН: ТЕКСТЫ ============
+@dp.callback_query(F.data == "admin_texts")
+async def admin_texts(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id): return
+    conn = get_db()
+    c = conn.cursor()
+    c.execute('SELECT * FROM text_config')
+    texts = c.fetchall()
+    conn.close()
+
+    text = "<b>📋 НАСТРОЙКА ТЕКСТОВ</b>\n\n"
+    if texts:
+        for t in texts:
+            text += f"• <code>{t['text_key']}</code>\n"
+    else:
+        text += "<i>Нет кастомных текстов.</i>"
+
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔙 Назад", callback_data="back_main")]
+        [InlineKeyboardButton(text="➕ Добавить текст", callback_data="admin_add_text")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="admin_back")],
     ])
     await callback.message.edit_text(text, reply_markup=kb)
     await callback.answer()
+
+@dp.callback_query(F.data == "admin_add_text")
+async def admin_add_text(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id): return
+    await callback.message.edit_text("Введите ключ текста (латиница):")
+    await state.set_state(AdminStates.waiting_for_text_key)
+    await callback.answer()
+
+@dp.message(AdminStates.waiting_for_text_key)
+async def text_key_received(message: Message, state: FSMContext):
+    await state.update_data(text_key=message.text.strip())
+    await message.answer("Введите содержимое текста:")
+    await state.set_state(AdminStates.waiting_for_text_content)
+
+@dp.message(AdminStates.waiting_for_text_content)
+async def text_content_received(message: Message, state: FSMContext):
+    data = await state.get_data()
+    conn = get_db()
+    c = conn.cursor()
+    c.execute('INSERT OR REPLACE INTO text_config (text_key, content) VALUES (?, ?)',
+              (data['text_key'], message.text))
+    conn.commit()
+    conn.close()
+    await message.answer(f"✅ Текст <code>{data['text_key']}</code> сохранён!")
+    await state.clear()
 
 # ============ АДМИН: РАССЫЛКА ============
 @dp.callback_query(F.data == "admin_broadcast")
@@ -1054,47 +1361,167 @@ async def broadcast_send(message: Message, state: FSMContext):
         try:
             await bot.send_message(u['user_id'], message.text)
             count += 1
+            await asyncio.sleep(0.05)
         except:
             pass
 
     await message.answer(f"✅ Рассылка отправлена: {count}/{len(users)}")
     await state.clear()
 
-# ============ АДМИН: КНОПКИ ============
-@dp.callback_query(F.data == "admin_buttons")
-async def admin_buttons(callback: CallbackQuery):
+# ============ НАВИГАЦИЯ ============
+@dp.callback_query(F.data == "back_main")
+async def back_main(callback: CallbackQuery):
+    if callback.message.chat.type == ChatType.PRIVATE:
+        await callback.message.edit_text(
+            "<b>🚀 ERWINS ESIM BOT</b>\n\nВыберите действие:",
+            reply_markup=main_menu()
+        )
+    await callback.answer()
+
+@dp.callback_query(F.data == "admin_back")
+async def admin_back(callback: CallbackQuery):
     if not is_admin(callback.from_user.id): return
+    await callback.message.edit_text("<b>🛠️ АДМИН-ПАНЕЛЬ</b>", reply_markup=admin_menu())
+    await callback.answer()
+
+@dp.callback_query(F.data == "close")
+async def close(callback: CallbackQuery):
+    try:
+        await callback.message.delete()
+    except:
+        pass
+    await callback.answer()
+
+# ============ ПРОФИЛЬ ============
+@dp.callback_query(F.data == "profile")
+async def profile(callback: CallbackQuery):
+    user = get_user(callback.from_user.id)
+    if not user:
+        ensure_user(callback.from_user.id, callback.from_user.username, callback.from_user.first_name)
+        user = get_user(callback.from_user.id)
+
+    text = (
+        f"<b>👤 ПРОФИЛЬ</b>\n\n"
+        f"🆔 @{user['username'] or user['user_id']}\n"
+        f"📊 <b>Ранг:</b> {user['rank']}\n"
+        f"💎 <b>Бонус:</b> +{user['bonus']}$ к каждому QR\n"
+        f"📱 <b>Зачтено QR за месяц:</b> {user['qr_month']}\n"
+        f"📈 <b>Всего QR:</b> {user['total_qr']}\n"
+        f"💵 <b>Баланс:</b> {user['balance']}$"
+    )
+    await callback.message.edit_text(text, reply_markup=back_to_main())
+    await callback.answer()
+
+# ============ ОПЕРАТОРЫ ============
+@dp.callback_query(F.data == "operators_list")
+async def operators_list(callback: CallbackQuery):
+    ops = get_operators()
+    text = "<b>📊 ОПЕРАТОРЫ И ЦЕНЫ</b>\n\n"
+    for op in ops:
+        text += f"{op['emoji']} <b>{op['name']}</b> · {op['price']}$\n"
+    await callback.message.edit_text(text, reply_markup=back_to_main())
+    await callback.answer()
+
+# ============ МОИ НОМЕРА ============
+@dp.callback_query(F.data == "my_numbers")
+async def my_numbers(callback: CallbackQuery):
     conn = get_db()
     c = conn.cursor()
-    c.execute('SELECT * FROM button_config')
-    rows = c.fetchall()
+    c.execute('SELECT * FROM orders WHERE executor_id = ? ORDER BY created DESC LIMIT 50',
+              (callback.from_user.id,))
+    orders = c.fetchall()
     conn.close()
 
-    text = "<b>📝 НАСТРОЙКА КНОПОК</b>\n\n"
-    for b in rows:
-        text += f"{b['emoji']} {b['text']} · {b['button_name']}\n"
+    if not orders:
+        text = "<b>📋 МОИ НОМЕРА</b>\n\n<i>Нет сданных номеров</i>"
+    else:
+        text = "<b>📋 МОИ НОМЕРА</b>\n\n"
+        for o in orders:
+            status_map = {'active': '🟡', 'taken': '🔵', 'done': '🟢'}
+            s = status_map.get(o['status'], '⚪')
+            phone = o['phone'] or '—'
+            text += f"{s} #{o['id']} {o['operator']} · <code>{phone}</code>\n"
 
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Добавить кнопку", callback_data="admin_add_button")],
-        [InlineKeyboardButton(text="🔙 Назад", callback_data="admin_back")],
-    ])
-    await callback.message.edit_text(text, reply_markup=kb)
+    await callback.message.edit_text(text, reply_markup=back_to_main())
     await callback.answer()
+
+# ============ РЕФЕРАЛЫ ============
+@dp.callback_query(F.data == "referral")
+async def referral(callback: CallbackQuery):
+    ensure_user(callback.from_user.id, callback.from_user.username, callback.from_user.first_name)
+    link = f"https://t.me/{(await bot.me()).username}?start=ref_{callback.from_user.id}"
+    user = get_user(callback.from_user.id)
+
+    conn = get_db()
+    c = conn.cursor()
+    c.execute('SELECT COUNT(*) FROM referrals WHERE referrer_id = ?', (callback.from_user.id,))
+    ref_count = c.fetchone()[0]
+    conn.close()
+
+    text = (
+        f"<b>👥 РЕФЕРАЛЬНАЯ СИСТЕМА</b>\n\n"
+        f"🔗 Ваша ссылка:\n<code>{link}</code>\n\n"
+        f"👥 <b>Рефералов:</b> {ref_count}\n"
+        f"📊 <b>Ранг:</b> {user['rank']}\n"
+        f"💎 <b>Бонус:</b> +{user['bonus']}$ к каждому QR\n"
+        f"📱 <b>QR за месяц:</b> {user['qr_month']}"
+    )
+    await callback.message.edit_text(text, reply_markup=back_to_main())
+    await callback.answer()
+
+# ============ ПОМОЩЬ ============
+@dp.callback_query(F.data == "help")
+async def help_cmd(callback: CallbackQuery):
+    text = (
+        "<b>ℹ️ ПОМОЩЬ</b>\n\n"
+        "<b>📱 Как сдать ESIM:</b>\n"
+        "1. Нажмите «Сдать ESIM»\n"
+        "2. Отправьте фото QR-кода\n"
+        "3. Укажите номер телефона\n\n"
+        "<b>🔥 Как взять заказ:</b>\n"
+        "• В канале нажмите «ЗАБРАТЬ ЗАКАЗ»\n"
+        "• В группе: /esim → выбрать оператора\n\n"
+        "<b>📋 Команды группы:</b>\n"
+        "/work — вкл/выкл бота\n"
+        "/esim — запросить номер\n"
+        "/orders — активные заявки\n"
+        "/rating — рейтинг исполнителей\n\n"
+        "<b>❓ Команды бота:</b>\n"
+        "/start — главное меню\n"
+        "/emjid — узнать ID эмодзи\n"
+        "/admin — админ-панель"
+    )
+    await callback.message.edit_text(text, reply_markup=back_to_main())
+    await callback.answer()
+
+# ============ ОБРАБОТКА НЕИЗВЕСТНЫХ СООБЩЕНИЙ ============
+@dp.message(F.text, F.chat.type == ChatType.PRIVATE)
+async def unknown_message(message: Message):
+    ensure_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
+    await message.answer(
+        "<b>🚀 ERWINS ESIM BOT</b>\n\nИспользуйте меню:",
+        reply_markup=main_menu()
+    )
 
 # ============ АВТОБЭКАП ============
 async def auto_backup_task():
     while True:
-        await asyncio.sleep(3600)  # раз в час
+        await asyncio.sleep(3600)
         if get_setting('auto_backup') == 'on':
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
             backup_path = os.path.join(BACKUP_DIR, f'backup_{timestamp}.db')
-            import shutil
             shutil.copy2(DB_PATH, backup_path)
             logger.info(f"Автобэкап сохранён: {backup_path}")
 
+            # Удаляем старые бэкапы (> 48 штук)
+            backups = sorted(os.listdir(BACKUP_DIR))
+            while len(backups) > 48:
+                old = backups.pop(0)
+                os.remove(os.path.join(BACKUP_DIR, old))
+
 # ============ ЗАПУСК ============
 async def main():
-    dp.startup.register(lambda: logger.info("Бот запущен"))
+    logger.info("Бот запущен")
     asyncio.create_task(auto_backup_task())
     await dp.start_polling(bot)
 
