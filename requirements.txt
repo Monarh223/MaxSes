@@ -1,5 +1,4 @@
-flask==3.0.0
-requests==2.31.0
-beautifulsoup4==4.12.2
-lxml==4.9.3
-playwright==1.41.0
+aiogram>=3.0
+qrcode>=7.0
+pillow>=9.0
+python-dotenv>=1.0
